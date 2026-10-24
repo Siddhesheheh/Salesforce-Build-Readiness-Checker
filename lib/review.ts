@@ -1,10 +1,11 @@
 import fs from "fs";
 import path from "path";
 import Ajv from "ajv";
-import { callModel } from "./llm";
+import { callModel, UpstreamApiError } from "./llm";
 import { Finding, ReadinessReport, ReadinessVerdict, Severity } from "./types";
 
 let cachedRubric: string | null = null;
+let cachedSchemaString: string | null = null;
 let cachedValidator: ReturnType<Ajv["compile"]> | null = null;
 
 function getRubric(): string {
@@ -15,15 +16,28 @@ function getRubric(): string {
   return cachedRubric;
 }
 
+function getSchemaString(): string {
+  if (!cachedSchemaString) {
+    const schemaPath = path.join(process.cwd(), "schema.json");
+    cachedSchemaString = fs.readFileSync(schemaPath, "utf-8");
+  }
+  return cachedSchemaString;
+}
+
 function getValidator() {
   if (!cachedValidator) {
-    const schemaPath = path.join(process.cwd(), "schema.json");
-    const schemaContent = fs.readFileSync(schemaPath, "utf-8");
-    const schemaJson = JSON.parse(schemaContent);
+    const schemaJson = JSON.parse(getSchemaString());
     const ajv = new Ajv({ allErrors: true });
     cachedValidator = ajv.compile(schemaJson);
   }
   return cachedValidator;
+}
+
+export function buildSystemPrompt(): string {
+  const rubric = getRubric();
+  const schemaStr = getSchemaString();
+
+  return `${rubric}\n\n## Target JSON Schema (schema.json)\nYou MUST return a JSON object that adheres strictly to the following JSON schema definition. Ensure all required fields, exact property names, types, and enum values are used:\n\`\`\`json\n${schemaStr}\n\`\`\``;
 }
 
 const SEVERITY_ORDER: Record<Severity, number> = {
@@ -79,32 +93,106 @@ export function buildUserPrompt(requirement: string, orgContext?: string): strin
   return `REQUIREMENT:\n${trimmedReq}\n\nORG CONTEXT:\n${trimmedContext}`;
 }
 
+export class SchemaValidationError extends Error {
+  errors: any[];
+  constructor(message: string, errors: any[] = []) {
+    super(message);
+    this.name = "SchemaValidationError";
+    this.errors = errors;
+  }
+}
+
+export interface ReviewDiagnostics {
+  modelCallAttempts: number;
+  schemaValidationRetries: number;
+}
+
+function isUpstreamApiFailure(err: unknown): boolean {
+  if (!err) return false;
+  if (err instanceof UpstreamApiError) return true;
+  if (typeof err === "object" && ("statusCode" in (err as any) || "status" in (err as any))) return true;
+  if (err instanceof Error) {
+    const msg = err.message.toLowerCase();
+    return (
+      msg.includes("gemini api") ||
+      msg.includes("quota") ||
+      msg.includes("status 429") ||
+      msg.includes("status 403") ||
+      msg.includes("status 404") ||
+      msg.includes("status 5") ||
+      msg.includes("fetch failed") ||
+      msg.includes("econnrefused") ||
+      msg.includes("network") ||
+      msg.includes("is not set in environment")
+    );
+  }
+  return false;
+}
+
 export async function reviewRequirement(
   requirement: string,
   orgContext?: string,
-  modelCaller: (system: string, user: string) => Promise<string> = callModel
+  modelCaller: (system: string, user: string) => Promise<string> = callModel,
+  diagnosticsOut?: ReviewDiagnostics
 ): Promise<ReadinessReport> {
-  const systemPrompt = getRubric();
+  const systemPrompt = buildSystemPrompt();
   const userPrompt = buildUserPrompt(requirement, orgContext);
   const validate = getValidator();
 
   let rawOutput = "";
   let parsed: unknown = null;
   let isValid = false;
+  let validationFeedback = "";
 
-  // Attempt 1
-  try {
-    rawOutput = await modelCaller(systemPrompt, userPrompt);
-    parsed = JSON.parse(rawOutput);
-    isValid = Boolean(validate(parsed));
-  } catch {
-    isValid = false;
+  if (diagnosticsOut) {
+    diagnosticsOut.modelCallAttempts = 0;
+    diagnosticsOut.schemaValidationRetries = 0;
   }
 
-  // Attempt 2 (retry once on invalid JSON or schema failure)
+  // Attempt 1: Call Model
+  try {
+    if (diagnosticsOut) diagnosticsOut.modelCallAttempts++;
+    rawOutput = await modelCaller(systemPrompt, userPrompt);
+  } catch (err: unknown) {
+    // If upstream API/network fails, re-throw immediately. Do not treat API errors as schema validation errors.
+    if (isUpstreamApiFailure(err)) {
+      throw err;
+    }
+    throw err;
+  }
+
+  // Validate Attempt 1 Output
+  try {
+    parsed = JSON.parse(rawOutput);
+    isValid = Boolean(validate(parsed));
+    if (!isValid && validate.errors) {
+      validationFeedback = validate.errors
+        .map((e) => `${e.instancePath || "root"}: ${e.message} (${e.keyword})`)
+        .join("; ");
+    }
+  } catch {
+    isValid = false;
+    validationFeedback = "Response was not valid JSON";
+  }
+
+  // Attempt 2: Retry once only on JSON/Schema validation failure
   if (!isValid) {
+    if (diagnosticsOut) {
+      diagnosticsOut.schemaValidationRetries++;
+      diagnosticsOut.modelCallAttempts++;
+    }
+    const retryUserPrompt = `${userPrompt}\n\nCORRECTION REQUIRED:\nYour previous output was invalid: ${validationFeedback}.\nYou must return a valid JSON object matching schema.json strictly with all required fields.`;
+
     try {
-      rawOutput = await modelCaller(systemPrompt, userPrompt);
+      rawOutput = await modelCaller(systemPrompt, retryUserPrompt);
+    } catch (err: unknown) {
+      if (isUpstreamApiFailure(err)) {
+        throw err;
+      }
+      throw err;
+    }
+
+    try {
       parsed = JSON.parse(rawOutput);
       isValid = Boolean(validate(parsed));
     } catch {
@@ -114,7 +202,10 @@ export async function reviewRequirement(
 
   if (!isValid || !parsed) {
     const errorDetails = validate.errors ? JSON.stringify(validate.errors) : "Invalid JSON output";
-    throw new Error(`Report validation failed against schema.json: ${errorDetails}`);
+    throw new SchemaValidationError(
+      `Report validation failed against schema.json: ${errorDetails}`,
+      validate.errors || []
+    );
   }
 
   const validatedReport = parsed as ReadinessReport;

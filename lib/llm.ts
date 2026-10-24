@@ -3,12 +3,24 @@
  * Never call this from client/browser code.
  */
 
+export class UpstreamApiError extends Error {
+  statusCode?: number;
+  isQuotaExceeded?: boolean;
+
+  constructor(message: string, statusCode?: number) {
+    super(message);
+    this.name = "UpstreamApiError";
+    this.statusCode = statusCode;
+    this.isQuotaExceeded = statusCode === 429 || /quota/i.test(message);
+  }
+}
+
 export async function callModel(system: string, user: string): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY;
   const model = process.env.LLM_MODEL || "gemini-3.8-flash";
 
   if (!apiKey) {
-    throw new Error("GEMINI_API_KEY or LLM_API_KEY is not set in environment.");
+    throw new UpstreamApiError("GEMINI_API_KEY or LLM_API_KEY is not set in environment.");
   }
 
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
@@ -38,8 +50,18 @@ export async function callModel(system: string, user: string): Promise<string> {
   });
 
   if (!response.ok) {
-    const errorBody = await response.text();
-    throw new Error(`Gemini API call failed with status ${response.status}: ${errorBody}`);
+    let errorDetails = "";
+    try {
+      const errJson = await response.json();
+      errorDetails = errJson?.error?.message || JSON.stringify(errJson);
+    } catch {
+      errorDetails = await response.text();
+    }
+    const sanitizedError = errorDetails.replace(/key=[a-zA-Z0-9_\-]+/gi, "key=[REDACTED]");
+    throw new UpstreamApiError(
+      `Gemini API call failed with status ${response.status}: ${sanitizedError}`,
+      response.status
+    );
   }
 
   const data = await response.json();
@@ -47,7 +69,7 @@ export async function callModel(system: string, user: string): Promise<string> {
 
   if (!candidate || !candidate.content?.parts?.[0]?.text) {
     const finishReason = candidate?.finishReason || "unknown";
-    throw new Error(`Gemini returned empty response (finishReason: ${finishReason})`);
+    throw new UpstreamApiError(`Gemini returned empty response (finishReason: ${finishReason})`);
   }
 
   const rawText = candidate.content.parts[0].text;

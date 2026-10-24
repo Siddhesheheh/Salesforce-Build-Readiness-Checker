@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { computeVerdictAndCounts, buildUserPrompt, reviewRequirement } from "../lib/review";
+import {
+  computeVerdictAndCounts,
+  buildUserPrompt,
+  buildSystemPrompt,
+  reviewRequirement,
+  ReviewDiagnostics,
+} from "../lib/review";
+import { UpstreamApiError } from "../lib/llm";
 import { ReadinessReport, Finding } from "../lib/types";
 
 const mockCategoryStatus: ReadinessReport["category_status"] = [
@@ -30,11 +37,30 @@ function createMockFinding(partial: Partial<Finding>): Finding {
   };
 }
 
+describe("lib/review: buildSystemPrompt", () => {
+  it("includes rubric instructions and the full schema.json specification", () => {
+    const prompt = buildSystemPrompt();
+
+    // Verify rubric instructions are present
+    expect(prompt).toContain("Reviewer instructions");
+    expect(prompt).toContain("The 10 categories");
+
+    // Verify schema structure is injected
+    expect(prompt).toContain("Target JSON Schema (schema.json)");
+    expect(prompt).toContain('"ReadinessReport"');
+    expect(prompt).toContain('"readiness_verdict"');
+    expect(prompt).toContain('"category_status"');
+    expect(prompt).toContain('"whats_missing"');
+    expect(prompt).toContain('"why_it_matters"');
+    expect(prompt).toContain('"question_for_pm"');
+  });
+});
+
 describe("lib/review: computeVerdictAndCounts", () => {
   it("forces verdict to 'Not ready to build' if any Blocker is present", () => {
     const report: ReadinessReport = {
       summary: "Sample summary",
-      readiness_verdict: "Ready to build", // Model hallucinated Ready to build
+      readiness_verdict: "Ready to build",
       counts: { blockers: 0, important: 0, minor: 0, questions: 0 },
       category_status: mockCategoryStatus,
       findings: [
@@ -54,7 +80,7 @@ describe("lib/review: computeVerdictAndCounts", () => {
   it("forces verdict to 'Needs clarification' if no Blockers but at least one Important", () => {
     const report: ReadinessReport = {
       summary: "Sample summary",
-      readiness_verdict: "Not ready to build", // Model erroneously set Not ready
+      readiness_verdict: "Not ready to build",
       counts: { blockers: 5, important: 0, minor: 0, questions: 0 },
       category_status: mockCategoryStatus,
       findings: [
@@ -149,40 +175,55 @@ describe("lib/review: reviewRequirement execution and retry logic", () => {
 
   it("succeeds on first attempt when valid JSON matching schema is returned", async () => {
     let callCount = 0;
-    const mockCaller = async () => {
+    const diagnostics: ReviewDiagnostics = { modelCallAttempts: 0, schemaValidationRetries: 0 };
+    const mockCaller = async (system: string, user: string) => {
       callCount++;
+      expect(system).toContain("Target JSON Schema (schema.json)");
+      expect(user).toContain("REQUIREMENT:\nTest requirement text here");
       return validReportJson;
     };
 
-    const report = await reviewRequirement("Test requirement text here", undefined, mockCaller);
+    const report = await reviewRequirement("Test requirement text here", undefined, mockCaller, diagnostics);
     expect(callCount).toBe(1);
     expect(report.readiness_verdict).toBe("Ready to build");
     expect(report.findings.length).toBe(1);
+    expect(diagnostics.modelCallAttempts).toBe(1);
+    expect(diagnostics.schemaValidationRetries).toBe(0);
   });
 
-  it("retries once if first attempt returns invalid JSON, and succeeds on second attempt", async () => {
+  it("retries once if first attempt returns invalid JSON, and provides feedback in retry prompt", async () => {
     let callCount = 0;
-    const mockCaller = async () => {
+    const userPromptsReceived: string[] = [];
+    const diagnostics: ReviewDiagnostics = { modelCallAttempts: 0, schemaValidationRetries: 0 };
+
+    const mockCaller = async (_system: string, user: string) => {
       callCount++;
+      userPromptsReceived.push(user);
       if (callCount === 1) {
         return "NOT VALID JSON";
       }
       return validReportJson;
     };
 
-    const report = await reviewRequirement("Test requirement text here", undefined, mockCaller);
+    const report = await reviewRequirement("Test requirement text here", undefined, mockCaller, diagnostics);
     expect(callCount).toBe(2);
     expect(report.readiness_verdict).toBe("Ready to build");
+    expect(userPromptsReceived[1]).toContain("CORRECTION REQUIRED");
+    expect(userPromptsReceived[1]).toContain("Response was not valid JSON");
+    expect(diagnostics.modelCallAttempts).toBe(2);
+    expect(diagnostics.schemaValidationRetries).toBe(1);
   });
 
-  it("retries once if first attempt fails schema validation, and succeeds on second attempt", async () => {
+  it("retries once if first attempt fails schema validation, and provides specific schema feedback", async () => {
     let callCount = 0;
+    const userPromptsReceived: string[] = [];
     const invalidSchemaJson = JSON.stringify({
       summary: "Missing required properties",
     });
 
-    const mockCaller = async () => {
+    const mockCaller = async (_system: string, user: string) => {
       callCount++;
+      userPromptsReceived.push(user);
       if (callCount === 1) {
         return invalidSchemaJson;
       }
@@ -192,6 +233,8 @@ describe("lib/review: reviewRequirement execution and retry logic", () => {
     const report = await reviewRequirement("Test requirement text here", undefined, mockCaller);
     expect(callCount).toBe(2);
     expect(report.readiness_verdict).toBe("Ready to build");
+    expect(userPromptsReceived[1]).toContain("CORRECTION REQUIRED");
+    expect(userPromptsReceived[1]).toContain("must have required property");
   });
 
   it("throws error when both attempts fail schema validation", async () => {
@@ -205,5 +248,20 @@ describe("lib/review: reviewRequirement execution and retry logic", () => {
       reviewRequirement("Test requirement text here", undefined, mockCaller)
     ).rejects.toThrow(/Report validation failed against schema\.json/);
     expect(callCount).toBe(2);
+  });
+
+  it("immediately re-throws upstream API errors (e.g. 429 quota exhaustion) without retrying schema prompt", async () => {
+    let callCount = 0;
+    const mockCaller = async () => {
+      callCount++;
+      throw new UpstreamApiError("Gemini API call failed with status 429: Quota exceeded", 429);
+    };
+
+    await expect(
+      reviewRequirement("Test requirement text here", undefined, mockCaller)
+    ).rejects.toThrow(/Gemini API call failed with status 429: Quota exceeded/);
+
+    // Assert that it did NOT trigger a schema correction retry on an upstream API failure
+    expect(callCount).toBe(1);
   });
 });
