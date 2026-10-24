@@ -1,0 +1,7 @@
+User Story: Automatic Lead Assignment
+As a Sales Manager, I want new leads to be automatically assigned to the appropriate sales representative, so that leads are handled quickly by the right person.
+
+Acceptance criteria:
+- New leads should be assigned automatically.
+- Leads should be assigned based on their region.
+- Sales Managers should be able to track lead assignments.

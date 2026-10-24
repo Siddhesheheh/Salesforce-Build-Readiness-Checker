@@ -1,0 +1,7 @@
+User Story: Manuscript Reviewer Assignment
+As an Acquisitions Editor, I want to assign an external reviewer to each submitted manuscript, so that every manuscript gets reviewed.
+
+Acceptance criteria:
+- The editor can select a reviewer on the manuscript record.
+- The reviewer is notified of the assignment.
+- Reviews are completed within the deadline.

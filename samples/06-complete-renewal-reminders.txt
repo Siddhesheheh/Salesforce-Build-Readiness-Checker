@@ -1,0 +1,34 @@
+User Story: Subscription Renewal Reminders
+As a Subscription Operations Specialist, I want customers to receive automatic renewal reminders before their subscription ends, so that fewer subscriptions lapse unintentionally.
+
+Current process: Finance emails customers manually from a spreadsheet each month. This is error-prone and misses customers. The spreadsheet is retired after go-live. The admin team confirmed the only existing flow on Subscription__c is "Set Status on Expiry", which runs when Renewal_Date__c passes and does not touch any reminder fields. There are no validation rules on the new fields.
+
+Business rules:
+- Eligible: Subscription__c where Status__c = "Active" and Auto_Renew__c = false.
+- Reminders are sent 60, 30 and 7 days before Renewal_Date__c. The daily run happens at 06:00 in the org's default time zone.
+- Paused and Cancelled subscriptions are excluded.
+- Contacts with Email Opt Out = true are skipped and a Task is created for Subscription Operations.
+
+Data:
+- New fields on Subscription__c: Last_Reminder_Sent__c (Date), Last_Reminder_Type__c (Picklist: 60/30/7).
+- Recipient is the Primary_Contact__c lookup (Contact). If it is empty or has no email, create a Task for Subscription Operations instead of sending.
+- About 12,000 active subscriptions; peak of roughly 1,500 reminders per day in January. Volume has been checked against the org's daily email allocation.
+- No backfill: existing active subscriptions are eligible only for the next upcoming threshold. No retroactive reminders are sent on go-live.
+
+Automation:
+- A scheduled Flow runs daily at 06:00. It must be safe for bulk runs and must not send the same reminder type twice (checked using Last_Reminder_Type__c).
+- Email uses a Lightning email template owned by Subscription Operations.
+
+Access:
+- Subscription Operations (profile) can view the reminder fields and the log. Finance has read-only access. The permission set "Renewal_Reminder_Admin" allows editing the template.
+- The flow runs in system context. Developers and UAT testers will receive the "Renewal_Reminder_Admin" permission set in the UAT sandbox, with 50 seeded test subscriptions.
+
+Reporting:
+- Dashboard "Renewal Reminders" shows reminders sent per week, tasks created for failures, and renewals within 14 days of a reminder. Source: Last_Reminder_Sent__c, Last_Reminder_Type__c, Task records.
+
+Acceptance criteria (Given/When/Then):
+- Given an active, non-auto-renew subscription renewing in 30 days, when the daily flow runs, then the 30-day email is sent once and the fields are updated.
+- Given the same subscription on the next run, then no duplicate is sent.
+- Given a contact with Email Opt Out, then no email is sent and a Task is created.
+- Given a Paused subscription, then nothing is sent.
+- Sign-off: Head of Subscriptions after UAT in the sandbox using the 50 test subscriptions.

@@ -1,0 +1,76 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "ReadinessReport",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["summary", "readiness_verdict", "counts", "category_status", "findings"],
+  "properties": {
+    "summary": { "type": "string", "maxLength": 400 },
+    "readiness_verdict": {
+      "type": "string",
+      "enum": ["Not ready to build", "Needs clarification", "Ready to build"]
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["blockers", "important", "minor", "questions"],
+      "properties": {
+        "blockers": { "type": "integer", "minimum": 0 },
+        "important": { "type": "integer", "minimum": 0 },
+        "minor": { "type": "integer", "minimum": 0 },
+        "questions": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "category_status": {
+      "type": "array",
+      "minItems": 10,
+      "maxItems": 10,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["category", "status"],
+        "properties": {
+          "category": { "$ref": "#/definitions/category" },
+          "status": { "type": "string", "enum": ["Covered", "Partial", "Missing", "Not applicable"] }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "title", "category", "severity", "evidence", "whats_missing", "why_it_matters", "question_for_pm", "verify_in_org"],
+        "properties": {
+          "id": { "type": "integer", "minimum": 1 },
+          "title": { "type": "string", "maxLength": 100 },
+          "category": { "$ref": "#/definitions/category" },
+          "severity": { "type": "string", "enum": ["Blocker", "Important", "Minor"] },
+          "evidence": { "type": "string", "description": "Short exact quote from the requirement, or 'Not stated' plus nearest related sentence." },
+          "whats_missing": { "type": "string" },
+          "why_it_matters": { "type": "string" },
+          "question_for_pm": { "type": "string" },
+          "verify_in_org": { "type": "string", "description": "What to check in Setup or the org before building. Empty string if nothing to verify." }
+        }
+      }
+    }
+  },
+  "definitions": {
+    "category": {
+      "type": "string",
+      "enum": [
+        "Business rules",
+        "Data model and relationships",
+        "Data fields and quality",
+        "Access, permissions and test access",
+        "Exceptions and edge cases",
+        "Automation behavior",
+        "Current process and existing org impact",
+        "Integrations, migration and scale",
+        "Reporting and visibility",
+        "Acceptance and sign-off"
+      ]
+    }
+  }
+}

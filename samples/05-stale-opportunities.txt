@@ -1,0 +1,7 @@
+User Story: Auto-Close Stale Opportunities
+As a Sales Operations Manager, I want opportunities with no activity for 60 days to be closed automatically, so that the pipeline stays accurate.
+
+Acceptance criteria:
+- Opportunities with no activity for 60 days are set to Closed Lost.
+- The system records why the opportunity was closed.
+- The owning sales rep receives an email when this happens.

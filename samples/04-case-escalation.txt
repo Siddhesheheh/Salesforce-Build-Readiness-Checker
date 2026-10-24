@@ -1,0 +1,7 @@
+User Story: Premium Subscriber Case Escalation
+As a Support Manager, I want cases from premium subscribers to be escalated automatically if they are not resolved in time, so that premium customers stay happy.
+
+Acceptance criteria:
+- Cases from premium subscribers are escalated if unresolved.
+- Escalated cases are visible to the Support Manager.
+- The customer is informed about the escalation.

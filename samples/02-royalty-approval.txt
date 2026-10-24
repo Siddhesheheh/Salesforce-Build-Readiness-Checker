@@ -1,0 +1,7 @@
+User Story: Author Royalty Approval
+As a Finance Lead, I want royalty statements to be approved before they are sent to authors, so that payments are accurate.
+
+Acceptance criteria:
+- Statements above a certain amount need approval.
+- Approved statements are emailed to authors.
+- Finance can see which statements are pending.

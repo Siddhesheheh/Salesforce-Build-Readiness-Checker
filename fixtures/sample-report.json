@@ -1,0 +1,109 @@
+{
+  "summary": "Core intent is clear, but the assignment rule, region source, and tracking needs are not defined. MOCK DATA FOR UI DEVELOPMENT ONLY.",
+  "readiness_verdict": "Not ready to build",
+  "counts": {
+    "blockers": 2,
+    "important": 2,
+    "minor": 1,
+    "questions": 5
+  },
+  "category_status": [
+    {
+      "category": "Business rules",
+      "status": "Missing"
+    },
+    {
+      "category": "Data model and relationships",
+      "status": "Partial"
+    },
+    {
+      "category": "Data fields and quality",
+      "status": "Missing"
+    },
+    {
+      "category": "Access, permissions and test access",
+      "status": "Missing"
+    },
+    {
+      "category": "Exceptions and edge cases",
+      "status": "Missing"
+    },
+    {
+      "category": "Automation behavior",
+      "status": "Partial"
+    },
+    {
+      "category": "Current process and existing org impact",
+      "status": "Missing"
+    },
+    {
+      "category": "Integrations, migration and scale",
+      "status": "Not applicable"
+    },
+    {
+      "category": "Reporting and visibility",
+      "status": "Partial"
+    },
+    {
+      "category": "Acceptance and sign-off",
+      "status": "Partial"
+    }
+  ],
+  "findings": [
+    {
+      "id": 1,
+      "title": "Region-to-representative mapping is undefined",
+      "category": "Business rules",
+      "severity": "Blocker",
+      "evidence": "\"Leads should be assigned based on their region.\"",
+      "whats_missing": "No mapping from region to representative, team, or queue, and no rule for regions with no match.",
+      "why_it_matters": "The routing logic cannot be built or tested without a mapping and a fallback owner.",
+      "question_for_pm": "Which representative, team, or queue owns each region? Who should own a lead whose region has no match?",
+      "verify_in_org": "Check whether lead assignment rules or queues already exist for Lead."
+    },
+    {
+      "id": 2,
+      "title": "Source of the region value is unclear",
+      "category": "Data fields and quality",
+      "severity": "Blocker",
+      "evidence": "\"Leads should be assigned based on their region.\"",
+      "whats_missing": "It is not stated which field holds the region or what happens when it is empty or invalid.",
+      "why_it_matters": "The implementation depends on the source field and on how incomplete data is handled.",
+      "question_for_pm": "Should region come from the standard address fields, a custom Region field, or another source? What should happen if it is blank?",
+      "verify_in_org": "Check which region-like fields exist on Lead and how reliably they are populated."
+    },
+    {
+      "id": 3,
+      "title": "Reassignment behavior is undefined",
+      "category": "Automation behavior",
+      "severity": "Important",
+      "evidence": "Not stated. Nearest: \"New leads should be assigned automatically.\"",
+      "whats_missing": "Only creation is covered. Nothing says what happens if the region changes later.",
+      "why_it_matters": "Reassigning on every change could disrupt ownership and follow-up; never reassigning could leave leads with the wrong owner.",
+      "question_for_pm": "Should a lead be reassigned when its region changes, or should routing apply only at creation?",
+      "verify_in_org": "Check for existing flows or triggers on Lead that change ownership."
+    },
+    {
+      "id": 4,
+      "title": "\"Track assignments\" is not defined",
+      "category": "Reporting and visibility",
+      "severity": "Important",
+      "evidence": "\"Sales Managers should be able to track lead assignments.\"",
+      "whats_missing": "The format (list view, report, dashboard), the fields, and which managers can see which leads are not stated.",
+      "why_it_matters": "The data to track and the visibility rules affect fields, reports, and sharing.",
+      "question_for_pm": "Is a filtered list view enough, or do managers need a report or dashboard? Which fields and which regions should each manager see?",
+      "verify_in_org": ""
+    },
+    {
+      "id": 5,
+      "title": "Leads created by import or API not mentioned",
+      "category": "Automation behavior",
+      "severity": "Minor",
+      "evidence": "Not stated. Nearest: \"New leads should be assigned automatically.\"",
+      "whats_missing": "It is unclear whether bulk-loaded or integration-created leads should follow the same routing.",
+      "why_it_matters": "Bulk and integration paths can behave differently from manual creation and need to be tested.",
+      "question_for_pm": "Should leads created by data import or by integrations be routed the same way as manually created leads?",
+      "verify_in_org": ""
+    }
+  ]
+}
