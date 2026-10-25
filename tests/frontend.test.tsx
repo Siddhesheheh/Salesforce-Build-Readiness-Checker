@@ -454,14 +454,60 @@ describe("Frontend: Results Screen (ResultsView)", () => {
     expect(html).toContain("Simulated");
     expect(html).toContain("This review was generated in Offline Mock Mode");
   });
+  it("renders export confidentiality warning in ResultsView", () => {
+    const mockReport: ReadinessReport = {
+      summary: "Clean report",
+      readiness_verdict: "Ready to build",
+      counts: { blockers: 0, important: 0, minor: 0, questions: 0 },
+      category_status: [],
+      findings: [],
+    };
+
+    const mockSession = {
+      sessionId: "session-123",
+      originalRequirement: "Valid requirement text exceeding twenty characters.",
+      createdAt: 1700000000000,
+      updatedAt: 1700000000000,
+      activeVersionIndex: 0,
+      versions: [
+        {
+          versionNumber: 1,
+          createdAt: 1700000000000,
+          report: mockReport,
+          requirement: "Valid requirement text exceeding twenty characters.",
+          orgContext: "",
+          feedback: {},
+          answers: {},
+        },
+      ],
+    };
+
+    const html = renderToStaticMarkup(
+      <ResultsView
+        report={mockReport}
+        requirement="Valid requirement text exceeding twenty characters."
+        session={mockSession as any}
+        currentVersion={mockSession.versions[0] as any}
+        onReset={() => {}}
+        onExport={() => {}}
+      />
+    );
+
+    expect(html).toContain(
+      "Exports include your requirement text, org context, and clarification answers. Share only if the information is nonconfidential."
+    );
+  });
 });
 
 describe("Frontend: Navbar & Footer", () => {
   it("renders Navbar with branding and reset button when active", () => {
-    const html = renderToStaticMarkup(<Navbar showReset={true} onReset={() => {}} />);
+    const html = renderToStaticMarkup(<Navbar showReset={true} onReset={() => {}} onExport={() => {}} />);
     expect(html).toContain("Salesforce Build Readiness Checker");
     expect(html).toContain("Pre-Build Rubric v1.0");
     expect(html).toContain("Review Another Requirement");
+    expect(html).toContain(
+      "Exports include your requirement text, org context, and clarification answers. Share only if the information is nonconfidential."
+    );
   });
 
   it("renders Footer with required disclaimer and data retention policy", () => {

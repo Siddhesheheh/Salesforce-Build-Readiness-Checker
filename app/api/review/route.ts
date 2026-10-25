@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { reviewRequirement, SchemaValidationError } from "@/lib/review";
 import { callModel, UpstreamApiError } from "@/lib/llm";
-import { isRateLimited } from "@/lib/rate-limit";
+import { checkRateLimit } from "@/lib/rate-limit";
 import { ReviewErrorResponse } from "@/lib/types";
 import { getMockReport } from "@/lib/mock-reports";
 import {
@@ -10,10 +10,10 @@ import {
   ReviewDiagnosticsCollector,
 } from "@/lib/request-context";
 
-// Vercel Serverless Function configuration
+// Vercel Serverless Function configuration (60s max allowed on Vercel Hobby plan; Pro supports up to 300)
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-export const maxDuration = 90;
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
@@ -22,9 +22,24 @@ export async function POST(req: NextRequest) {
   try {
     const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
 
-    if (isRateLimited(clientIp)) {
+    const rateLimitResult = await checkRateLimit(clientIp);
+    if (rateLimitResult.limited) {
+      if (rateLimitResult.source === "fail_closed") {
+        return NextResponse.json<ReviewErrorResponse>(
+          {
+            error: "review_failed",
+            message:
+              "The review service is temporarily unavailable. Your requirement and clarification answers are preserved. Please try again shortly.",
+          },
+          { status: 503 }
+        );
+      }
+
       return NextResponse.json<ReviewErrorResponse>(
-        { error: "rate_limited", message: "Rate limit exceeded. Please try again later." },
+        {
+          error: "rate_limited",
+          message: "Rate limit reached (10 requests per hour). Please wait before submitting another review.",
+        },
         { status: 429 }
       );
     }
@@ -118,18 +133,23 @@ export async function POST(req: NextRequest) {
       return NextResponse.json(mockReport, { status: 200 });
     }
 
-    // Strict overall deadline for interactive reviews (90 seconds default)
-    // Enforced across all Gemini HTTP attempts, schema retries, and backoff delays
-    const overallDeadlineMs = Number(process.env.OVERALL_REVIEW_DEADLINE_MS) || 90000;
+    // Strict overall deadline for interactive reviews (90s default in dev/test, 55s default in production)
+    // Preserves 90s local development behavior while ensuring production reviews return cleanly
+    // before Vercel Hobby's 60-second execution hard ceiling.
+    const defaultDeadlineMs = process.env.NODE_ENV === "production" ? 55000 : 90000;
+    const overallDeadlineMs =
+      Number(process.env.OVERALL_REVIEW_DEADLINE_MS || process.env.REVIEW_DEADLINE_MS) ||
+      defaultDeadlineMs;
     diagnostics = new ReviewDiagnosticsCollector(overallDeadlineMs);
     let deadlineTimer: NodeJS.Timeout | null = null;
     const overallAbortController = new AbortController();
 
     const deadlinePromise = new Promise<never>((_, reject) => {
       deadlineTimer = setTimeout(() => {
-        overallAbortController.abort(new Error("Overall review deadline exceeded (90s)"));
+        const deadlineSec = Math.round(overallDeadlineMs / 1000);
+        overallAbortController.abort(new Error(`Overall review deadline exceeded (${deadlineSec}s)`));
         const timeoutErr = new UpstreamApiError(
-          "The readiness review timed out after 90 seconds. The upstream AI service took too long to respond. Please try again.",
+          `The readiness review timed out after ${deadlineSec} seconds. The upstream AI service took too long to respond. Please try again.`,
           504
         );
         timeoutErr.name = "TimeoutError";

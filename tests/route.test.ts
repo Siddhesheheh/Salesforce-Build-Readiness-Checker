@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { NextRequest } from "next/server";
 import { POST } from "../app/api/review/route";
-import { resetRateLimiter } from "../lib/rate-limit";
+import * as rateLimitModule from "../lib/rate-limit";
 import * as reviewModule from "../lib/review";
 import { ReadinessReport } from "../lib/types";
 import { UpstreamApiError } from "../lib/llm";
@@ -38,7 +38,7 @@ const mockReport: ReadinessReport = {
 
 describe("POST /api/review route", () => {
   beforeEach(() => {
-    resetRateLimiter();
+    rateLimitModule.resetRateLimiter();
     vi.restoreAllMocks();
   });
 
@@ -155,7 +155,7 @@ describe("POST /api/review route", () => {
 
     expect(limitedRes.status).toBe(429);
     expect(limitedData.error).toBe("rate_limited");
-    expect(limitedData.message).toMatch(/Rate limit exceeded/);
+    expect(limitedData.message).toMatch(/Rate limit reached/);
 
     // Different IP is not affected
     const otherIpReq = createNextRequest(
@@ -166,9 +166,29 @@ describe("POST /api/review route", () => {
     expect(otherIpRes.status).toBe(200);
 
     // Resetting state clears rate limits deterministically
-    resetRateLimiter();
+    rateLimitModule.resetRateLimiter();
     const afterResetRes = await POST(limitedReq);
     expect(afterResetRes.status).toBe(200);
+  });
+
+  it("returns sanitized 503 service-unavailable response when rate limiter fails closed in production", async () => {
+    vi.stubEnv("NODE_ENV", "production");
+    delete process.env.UPSTASH_REDIS_REST_URL;
+    delete process.env.UPSTASH_REDIS_REST_TOKEN;
+
+    const req = createNextRequest({
+      requirement: "Valid requirement text exceeding twenty characters.",
+    });
+
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(503);
+    expect(data.error).toBe("review_failed");
+    expect(data.message).toBe(
+      "The review service is temporarily unavailable. Your requirement and clarification answers are preserved. Please try again shortly."
+    );
+    vi.unstubAllEnvs();
   });
 
   it("handles development mock mode and returns schema-compliant report", async () => {
@@ -216,6 +236,10 @@ describe("POST /api/review route", () => {
     const originalEnv = process.env.NODE_ENV;
     try {
       (process.env as any).NODE_ENV = "production";
+      vi.spyOn(rateLimitModule, "checkRateLimit").mockResolvedValue({
+        limited: false,
+        source: "upstash_redis",
+      });
       vi.spyOn(reviewModule, "reviewRequirement").mockResolvedValue(mockReport);
 
       const req = createNextRequest(
@@ -364,10 +388,10 @@ describe("POST /api/review route", () => {
     expect(loggedOutput).not.toContain("Private org metadata");
   });
 
-  it("exports Vercel Serverless Function configuration for 90-second Node.js execution", async () => {
+  it("exports Vercel Serverless Function configuration for Node.js execution compatible with Vercel Hobby/Pro", async () => {
     const route = await import("../app/api/review/route");
     expect(route.runtime).toBe("nodejs");
     expect(route.dynamic).toBe("force-dynamic");
-    expect(route.maxDuration).toBe(90);
+    expect(route.maxDuration).toBe(60);
   });
 });

@@ -124,7 +124,7 @@ export function ResultsView({
 
   // Character limit validation preview for recheck
   const recheckValidation = buildRecheckInput(
-    session.originalRequirement,
+    session.originalRequirement || legacyReq || "",
     currentVersion.answers || {},
     report.findings
   );
@@ -1066,6 +1066,7 @@ export function ResultsView({
             <button
               type="button"
               onClick={onExport}
+              title="Exports include your requirement text, org context, and clarification answers. Share only if the information is nonconfidential."
               className="inline-flex items-center px-3 py-1.5 bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] rounded-lg text-xs font-medium text-zinc-200 transition-colors"
             >
               <DownloadIcon className="w-3.5 h-3.5 mr-1.5 text-zinc-400" />
@@ -1104,6 +1105,12 @@ export function ResultsView({
               </div>
             )}
           </div>
+        </div>
+
+        {/* Export Confidentiality Notice */}
+        <div className="pt-3 border-t border-white/[0.04] flex items-center gap-2 text-[11px] text-amber-400/90">
+          <AlertTriangleIcon className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <span>Exports include your requirement text, org context, and clarification answers. Share only if the information is nonconfidential.</span>
         </div>
       </section>
 

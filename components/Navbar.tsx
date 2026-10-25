@@ -54,7 +54,7 @@ export function Navbar({
             <button
               type="button"
               onClick={onExport}
-              title="Download review session as JSON"
+              title="Exports include your requirement text, org context, and clarification answers. Share only if the information is nonconfidential."
               className="inline-flex items-center space-x-1.5 text-xs font-medium text-zinc-300 hover:text-white px-2.5 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.08] border border-white/[0.08] transition-all"
             >
               <DownloadIcon className="w-3.5 h-3.5 text-zinc-400" />
