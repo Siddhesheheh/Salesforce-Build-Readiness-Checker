@@ -1,6 +1,13 @@
 import fs from "fs";
 import path from "path";
-import { callModel, RequestBudget, RequestPacer, BudgetExceededError, UpstreamApiError } from "../lib/llm";
+import {
+  callModel,
+  resolveModelName,
+  RequestBudget,
+  RequestPacer,
+  BudgetExceededError,
+  UpstreamApiError,
+} from "../lib/llm";
 import { reviewRequirement, ReviewDiagnostics } from "../lib/review";
 import {
   analyzeSampleRuns,
@@ -138,7 +145,7 @@ async function run() {
   loadEnvironment();
 
   const apiKey = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL || "gemini-3.8-flash";
+  const model = resolveModelName();
 
   if (!apiKey) {
     console.error("\n❌ Fatal Error: No GEMINI_API_KEY or LLM_API_KEY found in .env.local or environment.");

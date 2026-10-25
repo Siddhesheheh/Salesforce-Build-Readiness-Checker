@@ -42,7 +42,7 @@ interface ResultsViewProps {
   onUpdateOverallFeedback?: (feedback: OverallFeedback) => void;
   onRecheck?: () => Promise<void>;
   isRechecking?: boolean;
-  recheckError?: string | null;
+  recheckError?: { title: string; message: string } | string | null;
   onReset?: () => void;
   onExport?: () => void;
   onClearHistory?: () => void;
@@ -921,8 +921,19 @@ export function ResultsView({
 
           {/* Validation or Error State */}
           {recheckError && (
-            <div className="bg-rose-950/30 border border-rose-500/30 rounded-xl p-3 text-xs text-rose-300">
-              {recheckError}
+            <div
+              role="alert"
+              className="bg-amber-950/30 border border-amber-500/30 rounded-xl p-4 flex items-start space-x-3 text-xs text-amber-200"
+            >
+              <AlertTriangleIcon className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
+              <div className="space-y-1">
+                <h3 className="font-semibold text-zinc-100 text-sm">
+                  {typeof recheckError === "object" ? recheckError.title : "Salesforce Readiness is temporarily busy"}
+                </h3>
+                <p className="text-zinc-300">
+                  {typeof recheckError === "object" ? recheckError.message : recheckError}
+                </p>
+              </div>
             </div>
           )}
 
@@ -941,10 +952,10 @@ export function ResultsView({
 
             <button
               type="button"
-              disabled={!canRecheck || Boolean(recheckValidation.error)}
+              disabled={!canRecheck || Boolean(recheckValidation.error) || isRechecking}
               onClick={onRecheck}
               className={`inline-flex items-center justify-center px-6 py-2.5 rounded-xl text-xs sm:text-sm font-semibold transition-all shadow-lg ${
-                canRecheck && !recheckValidation.error
+                canRecheck && !recheckValidation.error && !isRechecking
                   ? "bg-blue-600 hover:bg-blue-500 text-white shadow-blue-500/20 active:scale-[0.99] cursor-pointer"
                   : "bg-zinc-800 text-zinc-500 cursor-not-allowed border border-white/[0.04]"
               }`}

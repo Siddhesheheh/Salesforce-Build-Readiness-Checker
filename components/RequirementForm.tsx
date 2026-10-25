@@ -19,7 +19,7 @@ interface RequirementFormProps {
   setOrgContext: (val: string) => void;
   onSubmit: (e: React.FormEvent) => void;
   isLoading: boolean;
-  error: { code: string; message: string } | null;
+  error: { code: string; message: string; title?: string } | null;
   onClear: () => void;
   selectedSampleId: string;
   onSelectSample: (sample: SampleRequirement | null) => void;
@@ -145,25 +145,28 @@ export function RequirementForm({
           <div
             role="alert"
             className={`border-b px-6 py-4 flex items-start space-x-3 ${
-              error.code === "rate_limited" || error.code === "timeout"
+              error.code === "rate_limited" || error.code === "timeout" || error.code === "overloaded"
                 ? "bg-amber-950/30 border-amber-500/20 text-amber-200"
                 : "bg-rose-950/30 border-rose-500/20 text-rose-200"
             }`}
           >
-            {error.code === "rate_limited" || error.code === "timeout" ? (
+            {error.code === "rate_limited" || error.code === "timeout" || error.code === "overloaded" ? (
               <AlertTriangleIcon className="w-5 h-5 text-amber-400 flex-shrink-0 mt-0.5" />
             ) : (
               <AlertCircleIcon className="w-5 h-5 text-rose-400 flex-shrink-0 mt-0.5" />
             )}
             <div className="text-sm">
               <h2 className="font-semibold text-zinc-100">
-                {error.code === "rate_limited"
-                  ? "Rate limit reached"
-                  : error.code === "timeout"
-                  ? "Review request timed out"
-                  : error.code === "too_short" || error.code === "too_long"
-                  ? "Validation error"
-                  : "Review failed"}
+                {error.title ||
+                  (error.code === "overloaded"
+                    ? "Salesforce Readiness is temporarily busy"
+                    : error.code === "timeout"
+                    ? "Review is taking longer than expected"
+                    : error.code === "rate_limited"
+                    ? "Rate limit reached"
+                    : error.code === "too_short" || error.code === "too_long"
+                    ? "Validation error"
+                    : "Review failed")}
               </h2>
               <p className="mt-0.5 text-xs sm:text-sm text-zinc-300">{error.message}</p>
             </div>

@@ -189,8 +189,10 @@ describe("Frontend: Main Screen (RequirementForm)", () => {
         onSubmit={() => {}}
         isLoading={false}
         error={{
-          code: "review_failed",
-          message: "Unable to complete readiness review. Upstream AI service unavailable.",
+          code: "overloaded",
+          title: "Salesforce Readiness is temporarily busy",
+          message:
+            "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
         }}
         onClear={() => {}}
         selectedSampleId=""
@@ -198,12 +200,13 @@ describe("Frontend: Main Screen (RequirementForm)", () => {
       />
     );
 
-    expect(html).toContain("Review failed");
-    expect(html).toContain("Upstream AI service unavailable.");
+    expect(html).toContain("Salesforce Readiness is temporarily busy");
+    expect(html).toContain("The review service is experiencing high demand");
     expect(html).not.toContain("stack");
+    expect(html).not.toContain("Gemini");
   });
 
-  it("renders timeout error state properly", () => {
+  it("renders timeout error state properly with user-friendly preserved notice", () => {
     const html = renderToStaticMarkup(
       <RequirementForm
         requirement="Valid requirement text"
@@ -214,7 +217,9 @@ describe("Frontend: Main Screen (RequirementForm)", () => {
         isLoading={false}
         error={{
           code: "timeout",
-          message: "The readiness review timed out. The upstream AI service took too long to respond. Please try again.",
+          title: "Review is taking longer than expected",
+          message:
+            "Salesforce Readiness couldn't complete this review in time. Your work is preserved. Please try again.",
         }}
         onClear={() => {}}
         selectedSampleId=""
@@ -222,8 +227,10 @@ describe("Frontend: Main Screen (RequirementForm)", () => {
       />
     );
 
-    expect(html).toContain("Review request timed out");
-    expect(html).toContain("The readiness review timed out");
+    expect(html).toContain("Review is taking longer than expected");
+    expect(html).toContain("Salesforce Readiness");
+    expect(html).toContain("complete this review in time. Your work is preserved. Please try again.");
+    expect(html).not.toContain("Gemini");
   });
 
   it("renders offline mock mode toggle in non-production", () => {

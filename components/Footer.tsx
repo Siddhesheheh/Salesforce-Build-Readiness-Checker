@@ -12,7 +12,7 @@ export function Footer() {
             Review aid only. Does not replace developer judgment or stakeholder sign-off. Do not paste confidential client data.
           </p>
           <p className="text-[11px] text-zinc-600">
-            Review history, clarifying answers, and feedback are saved in this browser&apos;s local storage.
+            Requirements are analyzed transiently via secure AI APIs solely to generate readiness findings, with zero server retention. Review history, clarifying answers, and feedback are saved privately in this browser&apos;s local storage.
           </p>
         </div>
         <div className="flex items-center space-x-3 text-zinc-500 text-[11px]">

@@ -336,4 +336,38 @@ describe("POST /api/review route", () => {
     expect(JSON.stringify(data)).not.toContain("key=");
     expect(JSON.stringify(data)).not.toContain("stack");
   });
+
+  it("emits structured server-side timing diagnostics without leaking requirement or secret content", async () => {
+    const consoleSpy = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(reviewModule, "reviewRequirement").mockResolvedValue(mockReport);
+
+    const req = createNextRequest({
+      requirement: "This is a confidential requirement text that should not appear in logs.",
+      org_context: "Private org metadata context.",
+    });
+
+    const res = await POST(req);
+    expect(res.status).toBe(200);
+    expect(consoleSpy).toHaveBeenCalled();
+
+    const loggedOutput = consoleSpy.mock.calls[0][0];
+    const parsedLog = JSON.parse(loggedOutput);
+
+    expect(parsedLog.event).toBe("review_completed");
+    expect(parsedLog.total_duration_ms).toBeGreaterThanOrEqual(0);
+    expect(parsedLog.http_attempts_count).toBeDefined();
+    expect(parsedLog.schema_validation_retries).toBeDefined();
+    expect(parsedLog.attempts).toBeDefined();
+
+    // Verify sanitized: never log requirement text or org context
+    expect(loggedOutput).not.toContain("confidential requirement");
+    expect(loggedOutput).not.toContain("Private org metadata");
+  });
+
+  it("exports Vercel Serverless Function configuration for 90-second Node.js execution", async () => {
+    const route = await import("../app/api/review/route");
+    expect(route.runtime).toBe("nodejs");
+    expect(route.dynamic).toBe("force-dynamic");
+    expect(route.maxDuration).toBe(90);
+  });
 });

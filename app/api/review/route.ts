@@ -4,10 +4,20 @@ import { callModel, UpstreamApiError } from "@/lib/llm";
 import { isRateLimited } from "@/lib/rate-limit";
 import { ReviewErrorResponse } from "@/lib/types";
 import { getMockReport } from "@/lib/mock-reports";
-import { reviewAbortContext } from "@/lib/request-context";
+import {
+  reviewAbortContext,
+  reviewDiagnosticsContext,
+  ReviewDiagnosticsCollector,
+} from "@/lib/request-context";
+
+// Vercel Serverless Function configuration
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+export const maxDuration = 90;
 
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
+  let diagnostics: ReviewDiagnosticsCollector | null = null;
 
   try {
     const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
@@ -111,6 +121,7 @@ export async function POST(req: NextRequest) {
     // Strict overall deadline for interactive reviews (90 seconds default)
     // Enforced across all Gemini HTTP attempts, schema retries, and backoff delays
     const overallDeadlineMs = Number(process.env.OVERALL_REVIEW_DEADLINE_MS) || 90000;
+    diagnostics = new ReviewDiagnosticsCollector(overallDeadlineMs);
     let deadlineTimer: NodeJS.Timeout | null = null;
     const overallAbortController = new AbortController();
 
@@ -128,11 +139,13 @@ export async function POST(req: NextRequest) {
 
     let report: any;
     try {
-      report = await reviewAbortContext.run(overallAbortController, () =>
-        Promise.race([
-          reviewRequirement(trimmedReq, org_context),
-          deadlinePromise,
-        ])
+      report = await reviewDiagnosticsContext.run(diagnostics, () =>
+        reviewAbortContext.run(overallAbortController, () =>
+          Promise.race([
+            reviewRequirement(trimmedReq, org_context),
+            deadlinePromise,
+          ])
+        )
       );
     } finally {
       if (deadlineTimer) {
@@ -142,7 +155,7 @@ export async function POST(req: NextRequest) {
 
     const latencyMs = Date.now() - startTime;
 
-    // Log metadata only (never the requirement text or org context)
+    // Log sanitized metadata and attempt timings only (never the requirement text or org context)
     console.log(
       JSON.stringify({
         event: "review_completed",
@@ -151,7 +164,10 @@ export async function POST(req: NextRequest) {
         verdict: report.readiness_verdict,
         counts: report.counts,
         findings_count: report.findings.length,
-        latency_ms: latencyMs,
+        total_duration_ms: latencyMs,
+        http_attempts_count: diagnostics.httpAttempts.length,
+        schema_validation_retries: diagnostics.schemaValidationRetries,
+        attempts: diagnostics.httpAttempts,
       })
     );
 
@@ -164,11 +180,14 @@ export async function POST(req: NextRequest) {
     console.error(
       JSON.stringify({
         event: "review_failed",
-        latency_ms: latencyMs,
+        total_duration_ms: latencyMs,
         error_name: error?.name,
         error_message: sanitizedErrorMsg,
         error_cause: errorCause,
         status_code: error?.statusCode,
+        http_attempts_count: diagnostics?.httpAttempts?.length ?? 0,
+        schema_validation_retries: diagnostics?.schemaValidationRetries ?? 0,
+        attempts: diagnostics?.httpAttempts ?? [],
       })
     );
 
@@ -187,7 +206,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json<ReviewErrorResponse>(
         {
           error: "rate_limited",
-          message: "Rate limit reached on upstream AI service. Please wait before checking another requirement.",
+          message: "Rate limit reached (10 requests per hour). Please wait before submitting another review.",
         },
         { status: 429 }
       );
@@ -197,7 +216,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json<ReviewErrorResponse>(
         {
           error: "review_failed",
-          message: "The readiness review timed out. The upstream AI service took too long to respond. Please try again.",
+          message: "The readiness review timed out. Salesforce Readiness couldn't complete this review in time. Your work is preserved. Please try again.",
         },
         { status: 504 }
       );
@@ -216,7 +235,7 @@ export async function POST(req: NextRequest) {
     return NextResponse.json<ReviewErrorResponse>(
       {
         error: "review_failed",
-        message: "Failed to generate readiness review. The upstream AI service is temporarily unavailable or busy. Please retry.",
+        message: "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
       },
       { status: 502 }
     );

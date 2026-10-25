@@ -323,3 +323,45 @@ describe("Workflow: Offline Mock Mode Recheck & Guardrails (Part G)", () => {
     expect(THUMBS_DOWN_REASONS).toContain("Other");
   });
 });
+
+describe("Workflow: Failure Resilience (Prompt D / Task 7)", () => {
+  it("preserves user answers, feedback, and review history when a recheck fails", () => {
+    const existingSession: ReviewSession = {
+      sessionId: "session_failure_test",
+      originalRequirement: "Original specification text with at least twenty characters.",
+      versions: [
+        {
+          versionNumber: 1,
+          timestamp: "2026-10-25T10:00:00Z",
+          submittedRequirement: "Original specification text with at least twenty characters.",
+          report: mockReportV1,
+          findingFeedback: {
+            1: { findingId: 1, rating: "not_useful", reason: "Wrong severity", comment: "Should be Important", updatedAt: "2026-10-25T10:05:00Z" },
+          },
+          answers: {
+            1: {
+              findingId: 1,
+              question: "Which queue should receive unassigned leads?",
+              answerText: "Central Triage Queue",
+              updatedAt: "2026-10-25T10:05:00Z",
+            },
+          },
+          overallFeedback: { identifiedNewGap: "yes", wouldUseBeforeKickoff: "yes", updatedAt: "2026-10-25T10:05:00Z" },
+        },
+      ],
+      currentVersionNumber: 1,
+      createdAt: "2026-10-25T10:00:00Z",
+      updatedAt: "2026-10-25T10:05:00Z",
+    };
+
+    saveSession(existingSession);
+
+    // Verify that session state remains intact with all user clarifications and ratings
+    const reloaded = loadSession();
+    expect(reloaded).not.toBeNull();
+    expect(reloaded?.versions.length).toBe(1);
+    expect(reloaded?.versions[0].answers[1].answerText).toBe("Central Triage Queue");
+    expect(reloaded?.versions[0].findingFeedback[1].rating).toBe("not_useful");
+    expect(reloaded?.versions[0].overallFeedback?.identifiedNewGap).toBe("yes");
+  });
+});

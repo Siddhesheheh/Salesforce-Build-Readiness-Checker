@@ -179,4 +179,83 @@ describe("lib/llm: callModel", () => {
     expect(capturedSignal).toBeDefined();
     expect(capturedSignal?.aborted).toBe(true);
   });
+
+  it("records detailed HTTP attempt timings and outcomes into reviewDiagnosticsContext on transient retry and success", async () => {
+    const { reviewDiagnosticsContext, ReviewDiagnosticsCollector } = await import(
+      "../lib/request-context"
+    );
+    const collector = new ReviewDiagnosticsCollector(90000);
+    const mockSleep = vi.fn().mockResolvedValue(undefined);
+
+    let attemptCounter = 0;
+    const mockFetch = vi.fn().mockImplementation(async () => {
+      attemptCounter++;
+      if (attemptCounter === 1) {
+        return {
+          ok: false,
+          status: 503,
+          headers: { get: () => null },
+          text: async () => "The service is temporarily unavailable",
+        };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '{"summary":"Diagnostics test","readiness_verdict":"Ready to build"}' }],
+                role: "model",
+              },
+            },
+          ],
+        }),
+      };
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const result = await reviewDiagnosticsContext.run(collector, () =>
+      callModel("sys", "user", { sleepFn: mockSleep, maxTransientRetries: 1 })
+    );
+
+    expect(result).toContain("Diagnostics test");
+    expect(collector.httpAttempts.length).toBe(2);
+
+    // Attempt 1: Transient 503
+    expect(collector.httpAttempts[0].attempt).toBe(1);
+    expect(collector.httpAttempts[0].status).toBe(503);
+    expect(collector.httpAttempts[0].outcome).toBe("transient_retry");
+    expect(collector.httpAttempts[0].duration_ms).toBeGreaterThanOrEqual(0);
+    expect(collector.httpAttempts[0].backoff_ms).toBeDefined();
+
+    // Attempt 2: Success 200
+    expect(collector.httpAttempts[1].attempt).toBe(2);
+    expect(collector.httpAttempts[1].status).toBe(200);
+    expect(collector.httpAttempts[1].outcome).toBe("success");
+    expect(collector.httpAttempts[1].duration_ms).toBeGreaterThanOrEqual(0);
+  });
+
+  it("caps retry-after delay to maxBackoffMs to prevent interactive deadline exhaustion", async () => {
+    const mockSleep = vi.fn().mockResolvedValue(undefined);
+    const mockFetch = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 503,
+      headers: { get: (name: string) => (name.toLowerCase() === "retry-after" ? "60" : null) },
+      text: async () => "Service busy, retry in 60s",
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    await expect(
+      callModel("sys", "user", {
+        maxTransientRetries: 1,
+        maxBackoffMs: 5000,
+        sleepFn: mockSleep,
+      })
+    ).rejects.toThrow(/Gemini API call failed with status 503/);
+
+    expect(mockSleep).toHaveBeenCalledOnce();
+    const sleptMs = mockSleep.mock.calls[0][0];
+    expect(sleptMs).toBeLessThanOrEqual(5000); // Must be capped, not 60000ms!
+  });
 });

@@ -28,8 +28,8 @@ export function ReadinessChecker() {
   const [selectedSampleId, setSelectedSampleId] = useState<string>("");
   const [isLoading, setIsLoading] = useState<boolean>(false);
   const [isRechecking, setIsRechecking] = useState<boolean>(false);
-  const [error, setError] = useState<{ code: string; message: string } | null>(null);
-  const [recheckError, setRecheckError] = useState<string | null>(null);
+  const [error, setError] = useState<{ code: string; message: string; title?: string } | null>(null);
+  const [recheckError, setRecheckError] = useState<{ title: string; message: string } | string | null>(null);
   const [session, setSession] = useState<ReviewSession | null>(null);
   const [isMockMode, setIsMockMode] = useState<boolean>(false);
   const [mounted, setMounted] = useState<boolean>(false);
@@ -96,6 +96,7 @@ export function ReadinessChecker() {
 
   const handleSubmitInitial = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isLoading) return; // Prevent duplicate review submission
 
     const trimmedReq = requirement.trim();
     const trimmedOrg = orgContext.trim();
@@ -155,6 +156,7 @@ export function ReadinessChecker() {
         if (response.status === 429) {
           setError({
             code: "rate_limited",
+            title: "Rate limit reached",
             message:
               errData?.message ||
               "Rate limit reached (10 requests per hour). Please wait before submitting another review.",
@@ -162,21 +164,22 @@ export function ReadinessChecker() {
         } else if (response.status === 400) {
           setError({
             code: errData?.error || "validation_error",
+            title: "Validation error",
             message: errData?.message || "Invalid requirement length. Must be 20–6,000 characters.",
           });
         } else if (response.status === 504) {
           setError({
             code: "timeout",
+            title: "Review is taking longer than expected",
             message:
-              errData?.message ||
-              "The readiness review timed out. The AI service took too long to respond. Please try again.",
+              "Salesforce Readiness couldn't complete this review in time. Your work is preserved. Please try again.",
           });
         } else {
           setError({
-            code: "review_failed",
+            code: "overloaded",
+            title: "Salesforce Readiness is temporarily busy",
             message:
-              errData?.message ||
-              "Unable to complete readiness review. The upstream AI service is temporarily unavailable or busy. Please retry.",
+              "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
           });
         }
         setIsLoading(false);
@@ -213,8 +216,10 @@ export function ReadinessChecker() {
       }
     } catch {
       setError({
-        code: "network_error",
-        message: "Network error occurred while connecting to the review service. Please check your connection and retry.",
+        code: "overloaded",
+        title: "Salesforce Readiness is temporarily busy",
+        message:
+          "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
       });
       setIsLoading(false);
     }
@@ -222,7 +227,7 @@ export function ReadinessChecker() {
 
   // PART D: Recheck Readiness Handler
   const handleRecheck = async () => {
-    if (!session) return;
+    if (!session || isRechecking) return; // Prevent duplicate recheck submissions
 
     const currentVersion =
       session.versions.find((v) => v.versionNumber === session.currentVersionNumber) ||
@@ -260,22 +265,25 @@ export function ReadinessChecker() {
       });
 
       if (!response.ok) {
-        let errData: ReviewErrorResponse | null = null;
-        try {
-          errData = await response.json();
-        } catch {
-          // Response body was not JSON
+        if (response.status === 504) {
+          setRecheckError({
+            title: "Review is taking longer than expected",
+            message:
+              "Salesforce Readiness couldn't complete this review in time. Your work is preserved. Please try again.",
+          });
+        } else if (response.status === 429) {
+          setRecheckError({
+            title: "Rate limit reached",
+            message:
+              "Rate limit reached (10 requests per hour). Please wait before rechecking readiness.",
+          });
+        } else {
+          setRecheckError({
+            title: "Salesforce Readiness is temporarily busy",
+            message:
+              "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
+          });
         }
-
-        const msg =
-          errData?.message ||
-          (response.status === 429
-            ? "Rate limit reached. Please wait before rechecking readiness."
-            : response.status === 504
-            ? "The recheck request timed out. Please try again."
-            : "Recheck failed. Upstream service was unavailable.");
-
-        setRecheckError(msg);
         setIsRechecking(false);
         return;
       }
@@ -308,7 +316,11 @@ export function ReadinessChecker() {
         window.scrollTo({ top: 0, behavior: "smooth" });
       }
     } catch {
-      setRecheckError("Network error occurred during recheck. Your answers have been preserved. Please retry.");
+      setRecheckError({
+        title: "Salesforce Readiness is temporarily busy",
+        message:
+          "The review service is experiencing high demand. Your requirement and clarification answers are preserved. Please try again shortly.",
+      });
       setIsRechecking(false);
     }
   };
