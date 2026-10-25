@@ -3,6 +3,8 @@
  * Never call this from client/browser code.
  */
 
+import { reviewAbortContext } from "./request-context";
+
 export class UpstreamApiError extends Error {
   statusCode?: number;
   isQuotaExceeded?: boolean;
@@ -237,8 +239,14 @@ export async function callModel(
   };
 
   const bodyStr = JSON.stringify(payload);
+  const ambientController = reviewAbortContext.getStore();
+  const effectiveSignal = externalSignal || ambientController?.signal;
 
   for (let attempt = 0; attempt <= maxTransientRetries; attempt++) {
+    if (effectiveSignal?.aborted) {
+      throw new UpstreamApiError("Gemini API request aborted: overall deadline exceeded.", 504);
+    }
+
     // 1. Budget check: Never initiate an HTTP attempt that would exceed the budget
     if (budget) {
       if (budget.isExhausted) {
@@ -266,14 +274,14 @@ export async function callModel(
       }, timeoutMs);
     }
 
-    let onExternalAbort: (() => void) | null = null;
-    if (externalSignal) {
-      if (externalSignal.aborted) {
+    let onEffectiveAbort: (() => void) | null = null;
+    if (effectiveSignal) {
+      if (effectiveSignal.aborted) {
         if (timeoutTimer) clearTimeout(timeoutTimer);
-        throw new UpstreamApiError("Request was aborted before execution.", 499);
+        throw new UpstreamApiError("Request was aborted before execution.", 504);
       }
-      onExternalAbort = () => attemptController.abort(externalSignal.reason);
-      externalSignal.addEventListener("abort", onExternalAbort, { once: true });
+      onEffectiveAbort = () => attemptController.abort(effectiveSignal.reason);
+      effectiveSignal.addEventListener("abort", onEffectiveAbort, { once: true });
     }
 
     let response: Response;
@@ -292,6 +300,14 @@ export async function callModel(
       const rawErrMsg = `${fetchErr?.message || "fetch failed"} ${causeMsg}`.trim();
       const sanitizedErr = rawErrMsg.replace(/key=[a-zA-Z0-9_\-]+/gi, "key=[REDACTED]");
 
+      // Check if overall review deadline or external signal aborted this request
+      if (effectiveSignal?.aborted) {
+        throw new UpstreamApiError(
+          `Gemini API request was actively aborted: ${sanitizedErr}`,
+          504
+        );
+      }
+
       // Check if transient network retry is feasible
       if (attempt < maxTransientRetries) {
         if (budget && budget.isExhausted) {
@@ -303,6 +319,9 @@ export async function callModel(
         const backoff =
           Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
         await sleepFn(backoff);
+        if (effectiveSignal?.aborted) {
+          throw new UpstreamApiError("Gemini API request was actively aborted during backoff", 504);
+        }
         continue;
       }
 
@@ -319,8 +338,8 @@ export async function callModel(
       );
     } finally {
       if (timeoutTimer) clearTimeout(timeoutTimer);
-      if (externalSignal && onExternalAbort) {
-        externalSignal.removeEventListener("abort", onExternalAbort);
+      if (effectiveSignal && onEffectiveAbort) {
+        effectiveSignal.removeEventListener("abort", onEffectiveAbort);
       }
     }
 
@@ -347,6 +366,13 @@ export async function callModel(
       // Check if transient error (502, 503, 504) and we have retries remaining
       const isTransient = [502, 503, 504].includes(response.status);
       if (isTransient && attempt < maxTransientRetries) {
+        if (effectiveSignal?.aborted) {
+          throw new UpstreamApiError(
+            `Gemini API request was actively aborted: ${sanitizedError}`,
+            504
+          );
+        }
+
         // Can we make another attempt within budget?
         if (budget && budget.isExhausted) {
           throw new UpstreamApiError(
@@ -362,6 +388,9 @@ export async function callModel(
             : Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
 
         await sleepFn(backoff);
+        if (effectiveSignal?.aborted) {
+          throw new UpstreamApiError("Gemini API request was actively aborted during backoff", 504);
+        }
         continue;
       }
 

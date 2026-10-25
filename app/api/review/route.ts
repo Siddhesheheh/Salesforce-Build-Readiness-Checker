@@ -4,6 +4,7 @@ import { callModel, UpstreamApiError } from "@/lib/llm";
 import { isRateLimited } from "@/lib/rate-limit";
 import { ReviewErrorResponse } from "@/lib/types";
 import { getMockReport } from "@/lib/mock-reports";
+import { reviewAbortContext } from "@/lib/request-context";
 
 export async function POST(req: NextRequest) {
   const startTime = Date.now();
@@ -111,9 +112,11 @@ export async function POST(req: NextRequest) {
     // Enforced across all Gemini HTTP attempts, schema retries, and backoff delays
     const overallDeadlineMs = Number(process.env.OVERALL_REVIEW_DEADLINE_MS) || 90000;
     let deadlineTimer: NodeJS.Timeout | null = null;
+    const overallAbortController = new AbortController();
 
     const deadlinePromise = new Promise<never>((_, reject) => {
       deadlineTimer = setTimeout(() => {
+        overallAbortController.abort(new Error("Overall review deadline exceeded (90s)"));
         const timeoutErr = new UpstreamApiError(
           "The readiness review timed out after 90 seconds. The upstream AI service took too long to respond. Please try again.",
           504
@@ -125,10 +128,12 @@ export async function POST(req: NextRequest) {
 
     let report: any;
     try {
-      report = await Promise.race([
-        reviewRequirement(trimmedReq, org_context),
-        deadlinePromise,
-      ]);
+      report = await reviewAbortContext.run(overallAbortController, () =>
+        Promise.race([
+          reviewRequirement(trimmedReq, org_context),
+          deadlinePromise,
+        ])
+      );
     } finally {
       if (deadlineTimer) {
         clearTimeout(deadlineTimer);

@@ -3,6 +3,7 @@ import path from "path";
 import Ajv from "ajv";
 import { callModel, UpstreamApiError, BudgetExceededError } from "./llm";
 import { Finding, ReadinessReport, ReadinessVerdict, Severity } from "./types";
+import { reviewAbortContext } from "./request-context";
 
 let cachedRubric: string | null = null;
 let cachedSchemaString: string | null = null;
@@ -181,6 +182,9 @@ export async function reviewRequirement(
 
   // Attempt 2: Retry once only on JSON/Schema validation failure
   if (!isValid) {
+    if (reviewAbortContext.getStore()?.signal?.aborted) {
+      throw new UpstreamApiError("Review request aborted: overall deadline exceeded.", 504);
+    }
     if (diagnosticsOut) {
       diagnosticsOut.schemaValidationRetries++;
       diagnosticsOut.modelCallAttempts++;

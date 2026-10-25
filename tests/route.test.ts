@@ -273,6 +273,50 @@ describe("POST /api/review route", () => {
     }
   });
 
+  it("actively aborts underlying in-flight Gemini fetch when overall deadline expires", async () => {
+    const originalDeadline = process.env.OVERALL_REVIEW_DEADLINE_MS;
+    const originalApiKey = process.env.GEMINI_API_KEY;
+    try {
+      process.env.OVERALL_REVIEW_DEADLINE_MS = "40";
+      process.env.GEMINI_API_KEY = "test-key";
+
+      let fetchSignal: AbortSignal | undefined;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockImplementation((_url, options) => {
+          fetchSignal = options?.signal;
+          return new Promise((_resolve, reject) => {
+            if (options?.signal) {
+              options.signal.addEventListener("abort", () => {
+                const err = new Error("The operation was aborted");
+                err.name = "AbortError";
+                reject(err);
+              });
+            }
+          });
+        })
+      );
+
+      const req = createNextRequest({
+        requirement: "Valid requirement text exceeding twenty characters.",
+      });
+      const res = await POST(req);
+      const data = await res.json();
+
+      expect(res.status).toBe(504);
+      expect(data.error).toBe("review_failed");
+      expect(fetchSignal).toBeDefined();
+      expect(fetchSignal?.aborted).toBe(true);
+    } finally {
+      process.env.OVERALL_REVIEW_DEADLINE_MS = originalDeadline;
+      if (originalApiKey !== undefined) {
+        process.env.GEMINI_API_KEY = originalApiKey;
+      } else {
+        delete process.env.GEMINI_API_KEY;
+      }
+    }
+  });
+
   it("never exposes API keys or sensitive system details in client error responses", async () => {
     const sensitiveError = new Error(
       "Upstream request failed with key=AIzaSySecretApiKey12345 at internal URL /secret/v1/private"

@@ -146,4 +146,37 @@ describe("lib/llm: callModel", () => {
     expect(mockFetch).toHaveBeenCalledTimes(3);
     expect(mockSleep).toHaveBeenCalledTimes(2);
   });
+
+  it("actively aborts underlying fetch when ambient reviewAbortContext is aborted", async () => {
+    const { reviewAbortContext } = await import("../lib/request-context");
+    const abortController = new AbortController();
+
+    let capturedSignal: AbortSignal | undefined;
+    const mockFetch = vi.fn().mockImplementation((_url, options) => {
+      capturedSignal = options?.signal;
+      return new Promise((_resolve, reject) => {
+        if (options?.signal) {
+          options.signal.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        }
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    const callPromise = reviewAbortContext.run(abortController, () =>
+      callModel("sys", "user", { timeoutMs: 10000, maxTransientRetries: 0 })
+    );
+
+    // Abort ambient controller while fetch is active
+    setTimeout(() => {
+      abortController.abort(new Error("Overall deadline reached"));
+    }, 20);
+
+    await expect(callPromise).rejects.toThrow(/actively aborted/i);
+    expect(capturedSignal).toBeDefined();
+    expect(capturedSignal?.aborted).toBe(true);
+  });
 });
