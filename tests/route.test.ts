@@ -4,6 +4,7 @@ import { POST } from "../app/api/review/route";
 import { resetRateLimiter } from "../lib/rate-limit";
 import * as reviewModule from "../lib/review";
 import { ReadinessReport } from "../lib/types";
+import { UpstreamApiError } from "../lib/llm";
 
 function createNextRequest(body: any, headers?: Record<string, string>): NextRequest {
   return new NextRequest("http://localhost:3000/api/review", {
@@ -168,5 +169,127 @@ describe("POST /api/review route", () => {
     resetRateLimiter();
     const afterResetRes = await POST(limitedReq);
     expect(afterResetRes.status).toBe(200);
+  });
+
+  it("handles development mock mode and returns schema-compliant report", async () => {
+    const req = createNextRequest(
+      { requirement: "Valid requirement text exceeding twenty characters." },
+      { "x-mock-review": "true" }
+    );
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(200);
+    expect(data.readiness_verdict).toBeDefined();
+    expect(data.category_status.length).toBe(10);
+    expect(data.counts).toBeDefined();
+    expect(data.findings).toBeDefined();
+  });
+
+  it("handles simulated test error conditions in development mock mode", async () => {
+    // 1. Timeout simulation
+    const timeoutReq = createNextRequest(
+      { requirement: "Testing timeout condition with [TEST_TIMEOUT] flag." },
+      { "x-mock-review": "true" }
+    );
+    const timeoutRes = await POST(timeoutReq);
+    expect(timeoutRes.status).toBe(504);
+
+    // 2. Rate limit simulation
+    const rateLimitReq = createNextRequest(
+      { requirement: "Testing rate limit condition with [TEST_RATE_LIMIT] flag." },
+      { "x-mock-review": "true" }
+    );
+    const rateLimitRes = await POST(rateLimitReq);
+    expect(rateLimitRes.status).toBe(429);
+
+    // 3. Upstream failure simulation
+    const errorReq = createNextRequest(
+      { requirement: "Testing error condition with [TEST_ERROR] flag." },
+      { "x-mock-review": "true" }
+    );
+    const errorRes = await POST(errorReq);
+    expect(errorRes.status).toBe(502);
+  });
+
+  it("strictly disables mock mode in production environment", async () => {
+    const originalEnv = process.env.NODE_ENV;
+    try {
+      (process.env as any).NODE_ENV = "production";
+      vi.spyOn(reviewModule, "reviewRequirement").mockResolvedValue(mockReport);
+
+      const req = createNextRequest(
+        { requirement: "Valid requirement text exceeding twenty characters." },
+        { "x-mock-review": "true" }
+      );
+      const res = await POST(req);
+
+      // In production, x-mock-review is ignored and real reviewRequirement is invoked
+      expect(reviewModule.reviewRequirement).toHaveBeenCalled();
+      expect(res.status).toBe(200);
+    } finally {
+      (process.env as any).NODE_ENV = originalEnv;
+    }
+  });
+
+  it("maps upstream UpstreamApiError with status 504 or timeout to 504 review_failed", async () => {
+    const timeoutError = new UpstreamApiError("Gemini API request timed out after 25s", 504);
+
+    vi.spyOn(reviewModule, "reviewRequirement").mockRejectedValue(timeoutError);
+
+    const req = createNextRequest({
+      requirement: "Valid requirement text exceeding twenty characters.",
+    });
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(504);
+    expect(data.error).toBe("review_failed");
+    expect(data.message).toMatch(/timed out/i);
+  });
+
+  it("enforces strict overall deadline across review and returns 504 when exceeded", async () => {
+    const originalDeadline = process.env.OVERALL_REVIEW_DEADLINE_MS;
+    try {
+      // Set short deadline of 40ms for testing
+      process.env.OVERALL_REVIEW_DEADLINE_MS = "40";
+
+      // Mock reviewRequirement to take 100ms
+      vi.spyOn(reviewModule, "reviewRequirement").mockImplementation(
+        () => new Promise((resolve) => setTimeout(() => resolve(mockReport), 100))
+      );
+
+      const req = createNextRequest({
+        requirement: "Valid requirement text exceeding twenty characters.",
+      });
+      const res = await POST(req);
+      const data = await res.json();
+
+      expect(res.status).toBe(504);
+      expect(data.error).toBe("review_failed");
+      expect(data.message).toMatch(/timed out after 90 seconds|timed out/i);
+    } finally {
+      process.env.OVERALL_REVIEW_DEADLINE_MS = originalDeadline;
+    }
+  });
+
+  it("never exposes API keys or sensitive system details in client error responses", async () => {
+    const sensitiveError = new Error(
+      "Upstream request failed with key=AIzaSySecretApiKey12345 at internal URL /secret/v1/private"
+    );
+    vi.spyOn(reviewModule, "reviewRequirement").mockRejectedValue(sensitiveError);
+
+    const req = createNextRequest({
+      requirement: "Valid requirement text exceeding twenty characters.",
+    });
+    const res = await POST(req);
+    const data = await res.json();
+
+    expect(res.status).toBe(502);
+    expect(data.error).toBe("review_failed");
+    // Ensure no API keys or stack traces leaked in message
+    expect(JSON.stringify(data)).not.toContain("AIzaSySecretApiKey12345");
+    expect(JSON.stringify(data)).not.toContain("key=");
+    expect(JSON.stringify(data)).not.toContain("stack");
   });
 });

@@ -9,6 +9,8 @@ export interface RunArgs {
   sampleFilter: string | null;   // basename without .txt, e.g. "06-complete-renewal-reminders"
   runsOverride: number | null;   // 1-10, overrides default 5 (or 1 for smoke)
   extraFilter: ExtraTestName | null; // "injection" | "vague" | "nonsense"
+  maxCalls: number | null;       // positive integer budget limit for actual Gemini calls
+  minIntervalSeconds: number;   // minimum interval between actual HTTP attempts in seconds (default: 20)
   errors: string[];              // non-empty means invalid args
 }
 
@@ -81,6 +83,43 @@ export function parseRunArgs(argv: string[]): RunArgs {
     }
   }
 
+  // --max-calls <positive integer>
+  const maxCallsIdx = argv.indexOf("--max-calls");
+  const rawMaxCalls =
+    maxCallsIdx !== -1 && argv[maxCallsIdx + 1] && !argv[maxCallsIdx + 1].startsWith("--")
+      ? argv[maxCallsIdx + 1]
+      : null;
+  let maxCalls: number | null = null;
+  if (maxCallsIdx !== -1) {
+    if (!rawMaxCalls) {
+      errors.push("--max-calls requires a positive integer argument, e.g. --max-calls 10");
+    } else {
+      const parsed = parseInt(rawMaxCalls, 10);
+      if (isNaN(parsed) || parsed <= 0 || String(parsed) !== rawMaxCalls) {
+        errors.push(`--max-calls must be a positive integer (got "${rawMaxCalls}")`);
+      } else {
+        maxCalls = parsed;
+      }
+    }
+  }
+
+  // --min-interval <seconds> or --delay <seconds>
+  let minIntervalSeconds: number = 20;
+  const intervalIdx = argv.findIndex((a) => a === "--min-interval" || a === "--delay");
+  if (intervalIdx !== -1) {
+    const rawVal = argv[intervalIdx + 1];
+    if (!rawVal || rawVal.startsWith("--")) {
+      errors.push(`${argv[intervalIdx]} requires a number of seconds, e.g. ${argv[intervalIdx]} 20`);
+    } else {
+      const parsed = parseFloat(rawVal);
+      if (isNaN(parsed) || parsed < 0) {
+        errors.push(`${argv[intervalIdx]} must be a non-negative number of seconds (got "${rawVal}")`);
+      } else {
+        minIntervalSeconds = parsed;
+      }
+    }
+  }
+
   // Mutual-exclusion: --smoke cannot be combined with --sample, --runs, --resume, or --extra
   if (isSmoke && (sampleFilter || runsOverride !== null || resumeFilePath || extraIdx !== -1)) {
     errors.push("--smoke cannot be combined with --sample, --runs, --resume, or --extra");
@@ -91,7 +130,7 @@ export function parseRunArgs(argv: string[]): RunArgs {
     errors.push("--extra cannot be combined with --sample, --smoke, or --resume");
   }
 
-  return { isSmoke, resumeFilePath, sampleFilter, runsOverride, extraFilter, errors };
+  return { isSmoke, resumeFilePath, sampleFilter, runsOverride, extraFilter, maxCalls, minIntervalSeconds, errors };
 }
 
 /** Helper to filter sample files based on RunArgs. Exported for testing isolation. */

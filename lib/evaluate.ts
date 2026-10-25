@@ -5,7 +5,13 @@ export interface SampleRun {
   success: boolean;
   report?: ReadinessReport;
   error?: string;
-  errorType?: "api_quota" | "api_error" | "schema_validation" | "unknown";
+  errorType?:
+    | "api_quota"
+    | "rate_limit_rpm"
+    | "api_error"
+    | "schema_validation"
+    | "budget_exceeded"
+    | "unknown";
   latencyMs: number;
   diagnostics?: {
     modelCallAttempts: number;
@@ -19,12 +25,15 @@ export interface SampleMetrics {
   failedRuns: number;
   verdictDistribution: Record<string, number>;
   isConsistent: boolean;
+  isVerdictConsistent: boolean;
+  verdictAgreement: string;
   avgBlockers: number;
   avgImportant: number;
   avgMinor: number;
   avgQuestions: number;
   recurringCategories: string[];
-  meetsExpectedVerdict: boolean;
+  meetsExpectedVerdict: boolean | null;
+  evaluationStatus: "EVALUATED" | "NOT_EVALUATED";
   deviationNotes: string[];
 }
 
@@ -39,9 +48,20 @@ export const EXPECTED_SAMPLE_VERDICTS: Record<string, { expected: string; allowN
 
 export function categorizeError(
   errorMessage?: string
-): "api_quota" | "api_error" | "schema_validation" | "unknown" {
+): "api_quota" | "rate_limit_rpm" | "api_error" | "schema_validation" | "budget_exceeded" | "unknown" {
   if (!errorMessage) return "unknown";
   const lower = errorMessage.toLowerCase();
+  if (lower.includes("budget") || lower.includes("budgetexceedederror")) {
+    return "budget_exceeded";
+  }
+  if (
+    lower.includes("requests per minute") ||
+    lower.includes("free_tier_requests") ||
+    lower.includes("per minute") ||
+    lower.includes("rpm")
+  ) {
+    return "rate_limit_rpm";
+  }
   if (
     lower.includes("429") ||
     lower.includes("quota") ||
@@ -133,8 +153,15 @@ export function analyzeSampleRuns(
   const avgMinor = validCount > 0 ? Number((sumMinor / validCount).toFixed(2)) : 0;
   const avgQuestions = validCount > 0 ? Number((sumQuestions / validCount).toFixed(2)) : 0;
 
-  // Consistency: all valid runs have the same verdict
+  // Verdict consistency: do all valid evaluations agree?
   const uniqueVerdicts = Object.keys(verdictDistribution);
+  const isVerdictConsistent = validCount > 0 && uniqueVerdicts.length === 1;
+
+  // Maximum agreeing runs for the dominant verdict
+  const maxAgreeing = Math.max(0, ...Object.values(verdictDistribution));
+  const verdictAgreement = validCount > 0 ? `${maxAgreeing}/${validCount} valid runs agree` : "None";
+
+  // Legacy isConsistent: true only when valid runs agree AND 0 failures occurred
   const isConsistent = validCount > 0 && uniqueVerdicts.length === 1 && failedRuns === 0;
 
   // Recurring categories: present in at least threshold runs (e.g. 4 of 5 = 80%)
@@ -145,26 +172,34 @@ export function analyzeSampleRuns(
 
   // Deviation check against EXPECTED.md
   const deviationNotes: string[] = [];
-  let meetsExpectedVerdict = true;
+  let meetsExpectedVerdict: boolean | null = null;
+  const evaluationStatus: "EVALUATED" | "NOT_EVALUATED" =
+    validCount > 0 ? "EVALUATED" : "NOT_EVALUATED";
 
-  const expectation = EXPECTED_SAMPLE_VERDICTS[sampleId];
-  if (expectation) {
-    if (sampleId === "06-complete-renewal-reminders") {
-      // Sample 06 must NEVER return "Not ready to build" and should not have Blockers
-      const hasNotReady = Boolean(verdictDistribution["Not ready to build"]);
-      const hasBlockers = sumBlockers > 0;
-      if (hasNotReady || hasBlockers) {
-        meetsExpectedVerdict = false;
-        deviationNotes.push("Sample 06 returned 'Not ready to build' or generated Blockers.");
-      }
-    } else {
-      // Samples 01-05 should strictly return "Not ready to build"
-      for (const [verdict, count] of Object.entries(verdictDistribution)) {
-        if (verdict !== expectation.expected) {
+  if (validCount === 0) {
+    meetsExpectedVerdict = null;
+    deviationNotes.push("Not evaluated: 0 valid evaluations completed.");
+  } else {
+    meetsExpectedVerdict = true;
+    const expectation = EXPECTED_SAMPLE_VERDICTS[sampleId];
+    if (expectation) {
+      if (sampleId === "06-complete-renewal-reminders") {
+        // Sample 06 must NEVER return "Not ready to build" and should not have Blockers
+        const hasNotReady = Boolean(verdictDistribution["Not ready to build"]);
+        const hasBlockers = sumBlockers > 0;
+        if (hasNotReady || hasBlockers) {
           meetsExpectedVerdict = false;
-          deviationNotes.push(
-            `Expected '${expectation.expected}' but got '${verdict}' in ${count} run(s).`
-          );
+          deviationNotes.push("Sample 06 returned 'Not ready to build' or generated Blockers.");
+        }
+      } else {
+        // Samples 01-05 should strictly return "Not ready to build"
+        for (const [verdict, count] of Object.entries(verdictDistribution)) {
+          if (verdict !== expectation.expected) {
+            meetsExpectedVerdict = false;
+            deviationNotes.push(
+              `Expected '${expectation.expected}' but got '${verdict}' in ${count} run(s).`
+            );
+          }
         }
       }
     }
@@ -180,12 +215,15 @@ export function analyzeSampleRuns(
     failedRuns,
     verdictDistribution,
     isConsistent,
+    isVerdictConsistent,
+    verdictAgreement,
     avgBlockers,
     avgImportant,
     avgMinor,
     avgQuestions,
     recurringCategories,
     meetsExpectedVerdict,
+    evaluationStatus,
     deviationNotes,
   };
 }

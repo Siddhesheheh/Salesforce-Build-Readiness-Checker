@@ -1,5 +1,6 @@
 import fs from "fs";
 import path from "path";
+import { callModel, RequestBudget, RequestPacer, BudgetExceededError, UpstreamApiError } from "../lib/llm";
 import { reviewRequirement, ReviewDiagnostics } from "../lib/review";
 import {
   analyzeSampleRuns,
@@ -60,7 +61,6 @@ function parseEnvFile(filePath: string): void {
 }
 
 const DELAY_BETWEEN_CALLS_MS = 1000;
-const MAX_CALL_RETRIES = 1;
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -68,46 +68,70 @@ async function sleep(ms: number): Promise<void> {
 
 async function executeSingleReview(
   requirement: string,
+  budget: RequestBudget,
+  pacer: RequestPacer,
   orgContext?: string
 ): Promise<{
   success: boolean;
   report?: ReadinessReport;
   error?: string;
-  errorType?: "api_quota" | "api_error" | "schema_validation" | "unknown";
+  errorType?:
+    | "api_quota"
+    | "rate_limit_rpm"
+    | "api_error"
+    | "schema_validation"
+    | "budget_exceeded"
+    | "unknown";
   latencyMs: number;
   diagnostics?: ReviewDiagnostics;
 }> {
   const startTime = Date.now();
-  let lastError: any = null;
   const diagnostics: ReviewDiagnostics = { modelCallAttempts: 0, schemaValidationRetries: 0 };
 
-  for (let attempt = 0; attempt <= MAX_CALL_RETRIES; attempt++) {
-    try {
-      if (attempt > 0) {
-        await sleep(2000); // Backoff before retry
-      }
-      const report = await reviewRequirement(requirement, orgContext, undefined, diagnostics);
-      const latencyMs = Date.now() - startTime;
-      return { success: true, report, latencyMs, diagnostics };
-    } catch (err: any) {
-      lastError = err;
-      const errType = categorizeError(err?.message);
-      // Never retry if quota is exhausted or credentials are missing
-      if (errType === "api_quota" || err?.message?.includes("is not set in environment")) {
-        break;
-      }
-    }
+  if (budget.isExhausted) {
+    return {
+      success: false,
+      error: `Request budget exhausted (${budget.callsMade}/${budget.maxCalls} calls made)`,
+      errorType: "budget_exceeded",
+      latencyMs: 0,
+      diagnostics,
+    };
   }
 
-  const latencyMs = Date.now() - startTime;
-  const errorMsg = lastError?.message || "Unknown error during review execution";
-  return {
-    success: false,
-    error: errorMsg,
-    errorType: categorizeError(errorMsg),
-    latencyMs,
-    diagnostics,
-  };
+  const boundCaller = (system: string, user: string) =>
+    callModel(system, user, { budget, pacer });
+
+  try {
+    const report = await reviewRequirement(requirement, orgContext, boundCaller, diagnostics);
+    const latencyMs = Date.now() - startTime;
+    return { success: true, report, latencyMs, diagnostics };
+  } catch (err: any) {
+    const latencyMs = Date.now() - startTime;
+    const errorMsg = err?.message || "Unknown error during review execution";
+    let errorType:
+      | "api_quota"
+      | "rate_limit_rpm"
+      | "api_error"
+      | "schema_validation"
+      | "budget_exceeded"
+      | "unknown";
+
+    if (err instanceof BudgetExceededError) {
+      errorType = "budget_exceeded";
+    } else if (err instanceof UpstreamApiError && err.rateLimitType === "per_minute") {
+      errorType = "rate_limit_rpm";
+    } else {
+      errorType = categorizeError(errorMsg);
+    }
+
+    return {
+      success: false,
+      error: errorMsg,
+      errorType,
+      latencyMs,
+      diagnostics,
+    };
+  }
 }
 
 async function run() {
@@ -137,11 +161,15 @@ async function run() {
     console.error("  npx tsx scripts/run-samples.ts --sample <id> --runs 1  Single sample, custom run count");
     console.error("  npx tsx scripts/run-samples.ts --runs 2                All samples, 2 runs each");
     console.error("  npx tsx scripts/run-samples.ts --extra <name>          Run one edge case (injection, vague, nonsense)");
+    console.error("  npx tsx scripts/run-samples.ts --max-calls <n>         Limit actual Gemini HTTP attempts");
+    console.error("  npx tsx scripts/run-samples.ts --min-interval <sec>    Minimum seconds between HTTP attempts (default: 20)");
     console.error("  npx tsx scripts/run-samples.ts --resume results/...    Resume interrupted evaluation\n");
     process.exit(1);
   }
 
-  const { isSmoke, resumeFilePath, sampleFilter, runsOverride, extraFilter } = args;
+  const { isSmoke, resumeFilePath, sampleFilter, runsOverride, extraFilter, maxCalls, minIntervalSeconds } = args;
+  const budget = new RequestBudget(maxCalls);
+  const pacer = new RequestPacer(minIntervalSeconds);
 
   let existingResultsData: any = null;
   if (resumeFilePath) {
@@ -184,10 +212,21 @@ async function run() {
     modeLabel = "FULL EVALUATION (6 samples x 5 runs + 3 extra tests)";
   }
 
+  if (maxCalls !== null) {
+    modeLabel += ` [Max Calls: ${maxCalls}]`;
+  }
+  if (minIntervalSeconds !== 20) {
+    modeLabel += ` [Pace: ${minIntervalSeconds}s]`;
+  }
+
   console.log("==================================================================");
   console.log(` Salesforce Build Readiness Checker - Consistency Evaluation`);
   console.log(` Mode: ${modeLabel}`);
   console.log(` Model: ${model}`);
+  console.log(` Pacing Interval: ${minIntervalSeconds}s minimum between HTTP attempts`);
+  if (budget.maxCalls !== null) {
+    console.log(` Request Budget: ${budget.maxCalls} HTTP attempt(s) max`);
+  }
   if (resumeFilePath) {
     console.log(` Resume Source: ${resumeFilePath}`);
   }
@@ -239,6 +278,8 @@ async function run() {
 
     if (plan.neededRuns === 0) {
       console.log(`⏩ Skipping: ${filename} (all ${runsPerSample}/${runsPerSample} runs already completed in resume file)`);
+    } else if (budget.isExhausted) {
+      console.log(`⏭️ Skipping: ${filename} (request budget exhausted: ${budget.callsMade}/${budget.maxCalls} calls)`);
     } else if (abortedDueToFailures) {
       console.log(`⏭️ Skipping: ${filename} (evaluation aborted due to previous API failures)`);
     } else {
@@ -249,8 +290,13 @@ async function run() {
       }
 
       for (let r = plan.nextRunNumber; r <= runsPerSample; r++) {
+        if (budget.isExhausted) {
+          console.log(`\n🛑 Request budget reached (${budget.callsMade}/${budget.maxCalls} calls). Halting runs for ${filename}.`);
+          break;
+        }
+
         process.stdout.write(`   Run ${r}/${runsPerSample}... `);
-        const res = await executeSingleReview(requirementText);
+        const res = await executeSingleReview(requirementText, budget, pacer);
 
         if (res.success && res.report) {
           consecutiveFailures = 0;
@@ -267,8 +313,23 @@ async function run() {
           });
         } else {
           consecutiveFailures++;
-          const errTag = res.errorType === "api_quota" ? " [QUOTA 429]" : res.errorType === "api_error" ? " [API ERROR]" : "";
+          const errTag =
+            res.errorType === "rate_limit_rpm"
+              ? " [RATE LIMIT 429 (RPM)]"
+              : res.errorType === "api_quota"
+              ? " [QUOTA 429]"
+              : res.errorType === "budget_exceeded"
+              ? " [BUDGET EXHAUSTED]"
+              : res.errorType === "api_error"
+              ? " [API ERROR]"
+              : "";
           console.log(`✗ FAILED${errTag}: ${res.error}`);
+
+          if (res.errorType === "budget_exceeded") {
+            console.log(`   (Run ${r} not initiated: budget limit reached)`);
+            break;
+          }
+
           runs.push({
             runNumber: r,
             success: false,
@@ -278,8 +339,24 @@ async function run() {
             diagnostics: res.diagnostics,
           });
 
-          if (res.errorType === "api_quota") {
-            console.error("\n⚠️ Gemini API Quota Exhausted (HTTP 429). Rate or credit limit reached.");
+          // Handle 429 rate limit vs daily quota
+          if (res.errorType === "rate_limit_rpm" || res.errorType === "api_quota") {
+            const isDaily =
+              res.error?.toLowerCase().includes("per day") ||
+              res.error?.toLowerCase().includes("daily") ||
+              res.error?.toLowerCase().includes("rpd");
+
+            if (isDaily) {
+              console.error("\n🛑 Gemini API Daily Quota Exhausted (20 RPD free tier limit reached). Halting execution.");
+            } else {
+              const retryMatch =
+                res.error?.match(/retry in\s+([0-9.]+)\s*s/i) ||
+                res.error?.match(/retry after\s+([0-9.]+)\s*s/i);
+              const delayStr = retryMatch ? ` Server suggested retry delay: ${retryMatch[1]}s.` : "";
+              console.error(`\n🛑 Gemini API Rate Limit Exceeded (HTTP 429: 5 RPM limit reached).${delayStr} Halting gracefully to protect quota.`);
+            }
+            abortedDueToFailures = true;
+            break;
           }
 
           if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -287,6 +364,10 @@ async function run() {
             abortedDueToFailures = true;
             break;
           }
+        }
+
+        if (budget.isExhausted) {
+          break;
         }
 
         await sleep(DELAY_BETWEEN_CALLS_MS);
@@ -327,19 +408,31 @@ async function run() {
         return;
       }
 
+      if (budget.isExhausted) {
+        console.log(`   ⏭️ Skipping ${testName} (request budget exhausted: ${budget.callsMade}/${budget.maxCalls} calls)`);
+        extraTestResults.push({
+          name: testName,
+          input,
+          success: false,
+          error: "Skipped: request budget exhausted",
+          errorType: "budget_exceeded",
+        });
+        return;
+      }
+
       if (abortedDueToFailures) {
         console.log(`   ⏭️ Skipping ${testName} (evaluation aborted due to previous API failures)`);
         extraTestResults.push({
           name: testName,
           input,
           success: false,
-          error: "Aborted due to prior API failures.",
+          error: "Skipped: evaluation stopped early",
         });
         return;
       }
 
       process.stdout.write(`   ${testName}... `);
-      const res = await executeSingleReview(input);
+      const res = await executeSingleReview(input, budget, pacer);
       if (res.success && res.report) {
         consecutiveFailures = 0;
         const evalResult = evaluator(res.report);
@@ -359,15 +452,17 @@ async function run() {
       } else {
         consecutiveFailures++;
         console.log(`✗ FAILED: ${res.error}`);
-        extraTestResults.push({
-          name: testName,
-          input,
-          success: false,
-          error: res.error,
-          errorType: res.errorType,
-          latencyMs: res.latencyMs,
-          diagnostics: res.diagnostics,
-        });
+        if (res.errorType !== "budget_exceeded") {
+          extraTestResults.push({
+            name: testName,
+            input,
+            success: false,
+            error: res.error,
+            errorType: res.errorType,
+            latencyMs: res.latencyMs,
+            diagnostics: res.diagnostics,
+          });
+        }
       }
       await sleep(DELAY_BETWEEN_CALLS_MS);
     };
@@ -412,8 +507,26 @@ async function run() {
     console.log(`  Runs: ${m.validRuns}/${m.totalRuns} valid | Verdicts: ${verdictStr}`);
     console.log(`  Averages: ${m.avgBlockers} Blockers | ${m.avgImportant} Important | ${m.avgMinor} Minor | ${m.avgQuestions} Questions`);
     console.log(`  Recurring Categories (>= 80%): ${m.recurringCategories.length ? m.recurringCategories.join(", ") : "None"}`);
-    console.log(`  Consistency: ${m.isConsistent ? "✓ 100% IDENTICAL" : "⚠️ INCONSISTENT / FLAKY"}`);
-    console.log(`  Meets Expected: ${m.meetsExpectedVerdict ? "✓ YES" : "⚠️ DEVIATION DETECTED"}`);
+
+    // Separate verdict consistency from infrastructure reliability
+    if (m.validRuns > 0) {
+      console.log(`  Verdict Consistency: ${m.isVerdictConsistent ? "✓" : "⚠️"} ${m.verdictAgreement}`);
+    } else {
+      console.log(`  Verdict Consistency: NOT EVALUATED (0 valid runs)`);
+    }
+
+    if (m.failedRuns > 0) {
+      console.log(`  Infrastructure Reliability: ⚠️ ${m.failedRuns} infrastructure failure(s) (${m.validRuns}/${m.totalRuns} runs succeeded)`);
+    } else {
+      console.log(`  Infrastructure Reliability: ✓ 100% (${m.validRuns}/${m.totalRuns} runs succeeded)`);
+    }
+
+    if (m.evaluationStatus === "NOT_EVALUATED" || m.meetsExpectedVerdict === null) {
+      console.log(`  Meets Expected: NOT EVALUATED`);
+    } else {
+      console.log(`  Meets Expected: ${m.meetsExpectedVerdict ? "✓ YES" : "⚠️ DEVIATION DETECTED"}`);
+    }
+
     if (m.deviationNotes.length > 0) {
       for (const note of m.deviationNotes) {
         console.log(`    - Note: ${note}`);
@@ -424,7 +537,21 @@ async function run() {
   if (extraTestResults.length > 0) {
     console.log("\nExtra Tests Summary:");
     for (const t of extraTestResults) {
-      const statusStr = t.evaluation?.passed ? "✓ PASS" : "✗ FAIL";
+      const isSkipped =
+        (t as any).skipped ||
+        t.error?.toLowerCase().includes("budget") ||
+        t.error?.toLowerCase().includes("aborted") ||
+        t.error?.toLowerCase().includes("skipped") ||
+        t.error?.toLowerCase().includes("quota");
+
+      let statusStr: string;
+      if (isSkipped) {
+        statusStr = "⏭️ SKIPPED";
+      } else if (t.evaluation?.passed) {
+        statusStr = "✓ PASS";
+      } else {
+        statusStr = "✗ FAIL";
+      }
       console.log(`  - ${t.name}: ${statusStr} (${t.evaluation?.note || t.error})`);
     }
   }
@@ -472,13 +599,18 @@ async function run() {
   console.log(`  Min Latency:     ${minLatency}ms`);
   console.log(`  Max Latency:     ${maxLatency}ms`);
 
-  // Save full results to JSON
+  // Save results to JSON (checkpoint if budget exhausted or aborted early)
   const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const isCheckpoint = budget.isExhausted || abortedDueToFailures;
   let prefix = "run";
   if (isSmoke) prefix = "run-smoke";
   else if (extraFilter) prefix = `run-extra-${extraFilter}`;
   else if (sampleFilter) prefix = `run-sample-${sampleFilter}`;
   else if (resumeFilePath) prefix = "run-resumed";
+
+  if (isCheckpoint) {
+    prefix = `${prefix}-checkpoint`;
+  }
   const resultFileName = `${prefix}-${timestamp}.json`;
   const resultFilePath = path.join(resultsDir, resultFileName);
 
@@ -494,7 +626,20 @@ async function run() {
       ? "resumed"
       : "full",
     model,
-    args: { sampleFilter, extraFilter, runsPerSample, resumeFilePath },
+    budget: {
+      maxCalls: budget.maxCalls,
+      callsMade: budget.callsMade,
+      remaining: budget.remaining,
+      isExhausted: budget.isExhausted,
+    },
+    args: {
+      sampleFilter,
+      extraFilter,
+      runsPerSample,
+      resumeFilePath,
+      maxCalls: budget.maxCalls,
+      minIntervalSeconds,
+    },
     resumeSource: resumeFilePath || undefined,
     latencyStats,
     sampleResults,
@@ -502,7 +647,16 @@ async function run() {
   };
 
   fs.writeFileSync(resultFilePath, JSON.stringify(finalOutput, null, 2), "utf-8");
-  console.log(`\n📁 Full results saved to: results/${resultFileName}\n`);
+
+  if (isCheckpoint) {
+    console.log(`\n💾 Resumable checkpoint saved to: results/${resultFileName}`);
+    if (budget.isExhausted) {
+      console.log(`   Request budget limit reached (${budget.callsMade}/${budget.maxCalls} calls).`);
+    }
+    console.log(`   To resume later: npx tsx scripts/run-samples.ts --resume results/${resultFileName}\n`);
+  } else {
+    console.log(`\n📁 Full results saved to: results/${resultFileName}\n`);
+  }
 
   if (isSmoke) {
     const smokeSuccess = sampleResults[0]?.metrics?.validRuns === 1;

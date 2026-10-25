@@ -9,6 +9,8 @@ describe("scripts/args: parseRunArgs", () => {
     expect(a.runsOverride).toBeNull();
     expect(a.resumeFilePath).toBeNull();
     expect(a.extraFilter).toBeNull();
+    expect(a.maxCalls).toBeNull();
+    expect(a.minIntervalSeconds).toBe(20);
     expect(a.errors).toHaveLength(0);
   });
 
@@ -167,6 +169,115 @@ describe("scripts/args: parseRunArgs", () => {
     const a = parseRunArgs(["--extra", "injection", "--resume", "results/run-xxx.json"]);
     expect(a.errors.length).toBeGreaterThan(0);
     expect(a.errors.some((e) => e.includes("--extra cannot be combined with --sample, --smoke, or --resume"))).toBe(true);
+  });
+
+  // --max-calls flag tests
+  it("--max-calls <n> sets maxCalls to positive integer", () => {
+    const a = parseRunArgs(["--max-calls", "10"]);
+    expect(a.maxCalls).toBe(10);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--max-calls 1 is accepted", () => {
+    const a = parseRunArgs(["--max-calls", "1"]);
+    expect(a.maxCalls).toBe(1);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--max-calls without value produces an error", () => {
+    const a = parseRunArgs(["--max-calls"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--max-calls requires a positive integer/);
+  });
+
+  it("--max-calls 0 is rejected (not positive)", () => {
+    const a = parseRunArgs(["--max-calls", "0"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--max-calls must be a positive integer/);
+  });
+
+  it("--max-calls negative number is rejected", () => {
+    const a = parseRunArgs(["--max-calls", "-3"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--max-calls must be a positive integer/);
+  });
+
+  it("--max-calls non-integer string is rejected", () => {
+    const a = parseRunArgs(["--max-calls", "ten"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--max-calls must be a positive integer/);
+  });
+
+  it("--max-calls decimal number is rejected", () => {
+    const a = parseRunArgs(["--max-calls", "2.5"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--max-calls must be a positive integer/);
+  });
+
+  it("--max-calls can combine with --resume", () => {
+    const a = parseRunArgs(["--resume", "results/run-xxx.json", "--max-calls", "10"]);
+    expect(a.resumeFilePath).toBe("results/run-xxx.json");
+    expect(a.maxCalls).toBe(10);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--max-calls can combine with --sample and --runs", () => {
+    const a = parseRunArgs(["--sample", "02-royalty-approval", "--runs", "1", "--max-calls", "3"]);
+    expect(a.sampleFilter).toBe("02-royalty-approval");
+    expect(a.runsOverride).toBe(1);
+    expect(a.maxCalls).toBe(3);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--max-calls can combine with --smoke", () => {
+    const a = parseRunArgs(["--smoke", "--max-calls", "1"]);
+    expect(a.isSmoke).toBe(true);
+    expect(a.maxCalls).toBe(1);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--max-calls can combine with --extra", () => {
+    const a = parseRunArgs(["--extra", "injection", "--max-calls", "2"]);
+    expect(a.extraFilter).toBe("injection");
+    expect(a.maxCalls).toBe(2);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  // --min-interval / --delay flag tests
+  it("--min-interval sets custom pacing interval", () => {
+    const a = parseRunArgs(["--min-interval", "15"]);
+    expect(a.minIntervalSeconds).toBe(15);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--delay alias sets custom pacing interval", () => {
+    const a = parseRunArgs(["--delay", "5"]);
+    expect(a.minIntervalSeconds).toBe(5);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--min-interval 0 is accepted (e.g. for fast mocked testing)", () => {
+    const a = parseRunArgs(["--min-interval", "0"]);
+    expect(a.minIntervalSeconds).toBe(0);
+    expect(a.errors).toHaveLength(0);
+  });
+
+  it("--min-interval without value produces an error", () => {
+    const a = parseRunArgs(["--min-interval"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/--min-interval requires a number of seconds/);
+  });
+
+  it("--min-interval negative number produces an error", () => {
+    const a = parseRunArgs(["--min-interval", "-5"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/must be a non-negative number/);
+  });
+
+  it("--min-interval non-numeric string produces an error", () => {
+    const a = parseRunArgs(["--min-interval", "fast"]);
+    expect(a.errors.length).toBeGreaterThan(0);
+    expect(a.errors[0]).toMatch(/must be a non-negative number/);
   });
 });
 

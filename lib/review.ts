@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import Ajv from "ajv";
-import { callModel, UpstreamApiError } from "./llm";
+import { callModel, UpstreamApiError, BudgetExceededError } from "./llm";
 import { Finding, ReadinessReport, ReadinessVerdict, Severity } from "./types";
 
 let cachedRubric: string | null = null;
@@ -109,11 +109,12 @@ export interface ReviewDiagnostics {
 
 function isUpstreamApiFailure(err: unknown): boolean {
   if (!err) return false;
-  if (err instanceof UpstreamApiError) return true;
+  if (err instanceof UpstreamApiError || err instanceof BudgetExceededError) return true;
   if (typeof err === "object" && ("statusCode" in (err as any) || "status" in (err as any))) return true;
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
     return (
+      msg.includes("budget") ||
       msg.includes("gemini api") ||
       msg.includes("quota") ||
       msg.includes("status 429") ||
@@ -122,6 +123,9 @@ function isUpstreamApiFailure(err: unknown): boolean {
       msg.includes("status 5") ||
       msg.includes("fetch failed") ||
       msg.includes("econnrefused") ||
+      msg.includes("timed out") ||
+      msg.includes("timeout") ||
+      msg.includes("aborted") ||
       msg.includes("network") ||
       msg.includes("is not set in environment")
     );

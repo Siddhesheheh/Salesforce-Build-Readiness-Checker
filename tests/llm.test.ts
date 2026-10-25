@@ -109,4 +109,41 @@ describe("lib/llm: callModel", () => {
     const result = await callModel("system prompt", "user prompt");
     expect(result).toBe(innerJson);
   });
+
+  it("times out and throws 504 UpstreamApiError when request exceeds timeoutMs", async () => {
+    const mockFetch = vi.fn().mockImplementation((_url, options) => {
+      return new Promise((_resolve, reject) => {
+        if (options?.signal) {
+          options.signal.addEventListener("abort", () => {
+            const err = new Error("The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        }
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    // Call with short timeout of 50ms and 0 retries
+    await expect(
+      callModel("sys", "user", { timeoutMs: 50, maxTransientRetries: 0 })
+    ).rejects.toThrow(/timed out/i);
+  });
+
+  it("handles network-level fetch failure, retries, and throws sanitized 502 error", async () => {
+    const mockSleep = vi.fn().mockResolvedValue(undefined);
+    const mockFetch = vi.fn().mockRejectedValue(new TypeError("fetch failed"));
+    vi.stubGlobal("fetch", mockFetch);
+
+    await expect(
+      callModel("sys", "user", {
+        maxTransientRetries: 2,
+        sleepFn: mockSleep,
+      })
+    ).rejects.toThrow(/Gemini API network failure: fetch failed/);
+
+    // Should have attempted 3 times (1 initial + 2 retries)
+    expect(mockFetch).toHaveBeenCalledTimes(3);
+    expect(mockSleep).toHaveBeenCalledTimes(2);
+  });
 });
