@@ -337,4 +337,108 @@ describe("Prompt I: Deadline-Aware Retries & Reliability Diagnostics", () => {
     expect(sessionState.versions[0].answers[1].answerText).toBe("EMEA Unassigned Leads Queue");
     expect(sessionState.versions[0].report.findings.length).toBe(1);
   });
+
+  it("Prompt J regression: allocates full remaining runway (45663ms) without 45s cap on final retry", async () => {
+    // Exact timeline from Prompt J:
+    // - Overall deadline: 55,000 ms
+    // - Configured production model: gemini-3.8-flash
+    // - Attempt 1: 503 after 6,114 ms
+    // - Backoff: 1,223 ms
+    // - Attempt 2 start: elapsed 7,337 ms, remaining runway 47,663 ms
+    // - Expected Attempt 2 timeout: 47,663 - 2,000 = 45,663 ms (NOT capped at 45,000 ms)
+
+    process.env.LLM_MODEL = "gemini-3.8-flash";
+    let simulatedNow = 1700000000000;
+    const dateSpy = vi.spyOn(Date, "now").mockImplementation(() => simulatedNow);
+
+    const collector = new ReviewDiagnosticsCollector(55000, "gemini-3.8-flash");
+    const mockSleep = vi.fn().mockImplementation(async (backoffMs: number) => {
+      // Simulate sleep duration advancing clock
+      simulatedNow += 1223;
+    });
+
+    const capturedAttemptTimeouts: number[] = [];
+    const origSetTimeout = global.setTimeout;
+    vi.spyOn(global, "setTimeout").mockImplementation(((callback: any, delay?: number, ...args: any[]) => {
+      if (typeof delay === "number" && delay > 1000) {
+        capturedAttemptTimeouts.push(delay);
+        // If this is Attempt 2 (delay ~45663ms), trigger the timeout callback asynchronously
+        if (delay === 45663) {
+          simulatedNow += 45663;
+          return origSetTimeout(callback, 10, ...args);
+        }
+      }
+      return origSetTimeout(callback, delay, ...args);
+    }) as any);
+
+    let attemptCount = 0;
+    const mockFetch = vi.fn().mockImplementation((_url, opts) => {
+      attemptCount++;
+      if (attemptCount === 1) {
+        // Attempt 1: 503 after 6,114 ms
+        simulatedNow += 6114;
+        return Promise.resolve({
+          ok: false,
+          status: 503,
+          headers: { get: () => null },
+          text: async () => "This model is currently experiencing high demand.",
+        });
+      }
+
+      // Attempt 2: in-flight request waiting for response or timeout abort
+      return new Promise((_resolve, reject) => {
+        if (opts?.signal) {
+          opts.signal.addEventListener("abort", () => {
+            const err = new Error(opts.signal.reason?.message || "The operation was aborted");
+            err.name = "AbortError";
+            reject(err);
+          });
+        }
+      });
+    });
+    vi.stubGlobal("fetch", mockFetch);
+
+    // Execute interactive review call under diagnostics context
+    await expect(
+      reviewDiagnosticsContext.run(collector, () =>
+        callModel("sys", "user", {
+          sleepFn: mockSleep,
+          maxTransientRetries: 1,
+        })
+      )
+    ).rejects.toThrow(/Gemini API request timed out after 46s: Gemini API request timed out after 45663ms/i);
+
+    // Verify dynamic timeout allocation:
+    // Attempt 1: 39,000 ms (reserved 16s for retry)
+    // Attempt 2: 45,663 ms (full remaining runway 47,663 - 2,000 safety buffer)
+    expect(capturedAttemptTimeouts).toEqual([39000, 45663]);
+    expect(capturedAttemptTimeouts[1]).toBe(45663);
+    expect(capturedAttemptTimeouts[1]).toBeGreaterThan(45000); // Proves no 45s cap in Prompt I code!
+
+    // Verify diagnostics collection and logged fields
+    expect(collector.httpAttempts.length).toBe(2);
+
+    // Attempt 1 verification
+    const a1 = collector.httpAttempts[0];
+    expect(a1.attempt).toBe(1);
+    expect(a1.model).toBe("gemini-3.8-flash");
+    expect(a1.status).toBe(503);
+    expect(a1.outcome).toBe("transient_retry");
+    expect(a1.duration_ms).toBe(6114);
+    expect(a1.remaining_budget_ms).toBe(55000);
+
+    // Attempt 2 verification
+    const a2 = collector.httpAttempts[1];
+    expect(a2.attempt).toBe(2);
+    expect(a2.model).toBe("gemini-3.8-flash");
+    expect(a2.outcome).toBe("timeout");
+    expect(a2.remaining_budget_ms).toBe(47663);
+    expect(a2.duration_ms).toBe(45663);
+    expect(a2.error_reason).toContain("45663ms");
+
+    // Retry was not skipped
+    expect(collector.retrySkippedDueToInsufficientTime).toBe(false);
+
+    dateSpy.mockRestore();
+  });
 });
