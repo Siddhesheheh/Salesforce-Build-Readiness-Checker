@@ -1,7 +1,7 @@
 import fs from "fs";
 import path from "path";
 import Ajv from "ajv";
-import { callModel, UpstreamApiError, BudgetExceededError } from "./llm";
+import { callModel, UpstreamApiError, BudgetExceededError, MIN_REASONABLE_ATTEMPT_TIME_MS } from "./llm";
 import { Finding, ReadinessReport, ReadinessVerdict, Severity } from "./types";
 import { reviewAbortContext, reviewDiagnosticsContext } from "./request-context";
 
@@ -187,8 +187,19 @@ export async function reviewRequirement(
       diagCollector.schemaValidationRetries++;
       diagCollector.activePhase = "schema_correction";
 
-      // If less than 10 seconds remain before interactive deadline, abort schema retry
-      if (diagCollector.overallDeadlineMs > 15000 && diagCollector.remainingMs < 10000) {
+      // If insufficient time remains before interactive deadline, abort schema retry
+      if (diagCollector.overallDeadlineMs > 5000 && diagCollector.remainingMs < MIN_REASONABLE_ATTEMPT_TIME_MS) {
+        diagCollector.retrySkippedDueToInsufficientTime = true;
+        diagCollector.recordAttempt({
+          attempt: (diagnosticsOut?.modelCallAttempts ?? 1) + 1,
+          model: diagCollector.model,
+          phase: "schema_correction",
+          duration_ms: 0,
+          remaining_budget_ms: diagCollector.remainingMs,
+          outcome: "validation_error",
+          error_reason: `Schema validation failed on attempt 1 and insufficient time remained for correction (${Math.round(diagCollector.remainingMs / 1000)}s remaining): ${validationFeedback}`,
+          retry_skipped_insufficient_time: true,
+        });
         throw new SchemaValidationError(
           `Schema validation failed on attempt 1 and insufficient time remained for correction (${Math.round(diagCollector.remainingMs / 1000)}s remaining): ${validationFeedback}`
         );

@@ -1,13 +1,27 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 
+export type AttemptOutcome =
+  | "success"
+  | "429"
+  | "503"
+  | "timeout"
+  | "network_error"
+  | "validation_error"
+  | "transient_retry"
+  | "aborted"
+  | "error";
+
 export interface HttpAttemptTiming {
   attempt: number;
+  model: string;
   phase: "initial_review" | "schema_correction";
   duration_ms: number;
+  remaining_budget_ms?: number;
   status?: number;
-  outcome: "success" | "transient_retry" | "timeout" | "aborted" | "rate_limited" | "error";
+  outcome: AttemptOutcome;
   error_reason?: string;
   backoff_ms?: number;
+  retry_skipped_insufficient_time?: boolean;
 }
 
 /**
@@ -18,13 +32,16 @@ export interface HttpAttemptTiming {
 export class ReviewDiagnosticsCollector {
   readonly startTime: number;
   readonly overallDeadlineMs: number;
+  model: string;
   readonly httpAttempts: HttpAttemptTiming[] = [];
   schemaValidationRetries: number = 0;
   activePhase: "initial_review" | "schema_correction" = "initial_review";
+  retrySkippedDueToInsufficientTime: boolean = false;
 
-  constructor(overallDeadlineMs: number = 90000) {
+  constructor(overallDeadlineMs: number = 90000, model: string = "unknown") {
     this.startTime = Date.now();
     this.overallDeadlineMs = overallDeadlineMs;
+    this.model = model;
   }
 
   get elapsedMs(): number {
@@ -42,7 +59,7 @@ export class ReviewDiagnosticsCollector {
 
 /**
  * Ambient request context storing an AbortController for active web reviews.
- * Allows the 90-second overall deadline to actively abort underlying Gemini fetches
+ * Allows the overall deadline to actively abort underlying Gemini fetches
  * without breaking signatures of existing callers or spies.
  */
 export const reviewAbortContext = new AsyncLocalStorage<AbortController>();

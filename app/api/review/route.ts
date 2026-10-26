@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { reviewRequirement, SchemaValidationError } from "@/lib/review";
-import { callModel, UpstreamApiError } from "@/lib/llm";
+import { callModel, UpstreamApiError, resolveModelName } from "@/lib/llm";
 import { checkRateLimit } from "@/lib/rate-limit";
 import { ReviewErrorResponse } from "@/lib/types";
 import { getMockReport } from "@/lib/mock-reports";
@@ -140,7 +140,8 @@ export async function POST(req: NextRequest) {
     const overallDeadlineMs =
       Number(process.env.OVERALL_REVIEW_DEADLINE_MS || process.env.REVIEW_DEADLINE_MS) ||
       defaultDeadlineMs;
-    diagnostics = new ReviewDiagnosticsCollector(overallDeadlineMs);
+    const modelName = resolveModelName();
+    diagnostics = new ReviewDiagnosticsCollector(overallDeadlineMs, modelName);
     let deadlineTimer: NodeJS.Timeout | null = null;
     const overallAbortController = new AbortController();
 
@@ -179,6 +180,7 @@ export async function POST(req: NextRequest) {
     console.log(
       JSON.stringify({
         event: "review_completed",
+        model: diagnostics.model,
         req_length: trimmedReq.length,
         org_context_length: org_context ? org_context.length : 0,
         verdict: report.readiness_verdict,
@@ -187,6 +189,7 @@ export async function POST(req: NextRequest) {
         total_duration_ms: latencyMs,
         http_attempts_count: diagnostics.httpAttempts.length,
         schema_validation_retries: diagnostics.schemaValidationRetries,
+        retry_skipped_insufficient_time: diagnostics.retrySkippedDueToInsufficientTime,
         attempts: diagnostics.httpAttempts,
       })
     );
@@ -200,6 +203,7 @@ export async function POST(req: NextRequest) {
     console.error(
       JSON.stringify({
         event: "review_failed",
+        model: diagnostics?.model || resolveModelName(),
         total_duration_ms: latencyMs,
         error_name: error?.name,
         error_message: sanitizedErrorMsg,
@@ -207,6 +211,7 @@ export async function POST(req: NextRequest) {
         status_code: error?.statusCode,
         http_attempts_count: diagnostics?.httpAttempts?.length ?? 0,
         schema_validation_retries: diagnostics?.schemaValidationRetries ?? 0,
+        retry_skipped_insufficient_time: diagnostics?.retrySkippedDueToInsufficientTime ?? false,
         attempts: diagnostics?.httpAttempts ?? [],
       })
     );

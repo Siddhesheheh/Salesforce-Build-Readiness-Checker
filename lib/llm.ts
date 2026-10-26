@@ -209,6 +209,9 @@ export function resolveModelName(configuredModel?: string | null): string {
   return stripped || "gemini-3.8-flash";
 }
 
+/** Minimum viable duration (ms) for Gemini Flash to generate a complete 10-category rubric JSON report */
+export const MIN_REASONABLE_ATTEMPT_TIME_MS = 14000;
+
 export async function callModel(
   system: string,
   user: string,
@@ -257,6 +260,10 @@ export async function callModel(
   const isInteractive = Boolean(ambientController || diagCollector);
   const effectiveSignal = externalSignal || ambientController?.signal;
 
+  if (diagCollector && (!diagCollector.model || diagCollector.model === "unknown")) {
+    diagCollector.model = model;
+  }
+
   // In interactive reviews, default to 45s attempt timeout to allow Gemini Flash
   // enough time to generate complete 10-category JSON reports (especially for rechecks with user clarifications),
   // and 1 transient retry (up to 2 attempts max) to fit within the 90s overall deadline.
@@ -271,12 +278,27 @@ export async function callModel(
       throw new UpstreamApiError("Gemini API request aborted: overall deadline exceeded.", 504);
     }
 
-    // In interactive mode, if remaining budget is less than 3s (and not in micro-test mode), halt immediately
-    if (diagCollector && diagCollector.overallDeadlineMs > 5000 && diagCollector.remainingMs < 3000) {
-      throw new UpstreamApiError(
-        "Gemini API request aborted: insufficient time remaining before deadline.",
-        504
-      );
+    const remainingBudgetAtStart = diagCollector ? diagCollector.remainingMs : undefined;
+
+    // In interactive mode, if remaining deadline is insufficient to reasonably complete an attempt, halt immediately
+    if (diagCollector && diagCollector.overallDeadlineMs > 5000) {
+      if (attempt > 0 && diagCollector.remainingMs < MIN_REASONABLE_ATTEMPT_TIME_MS) {
+        diagCollector.retrySkippedDueToInsufficientTime = true;
+        diagCollector.recordAttempt({
+          attempt: attempt + 1,
+          model,
+          phase: diagCollector.activePhase,
+          duration_ms: 0,
+          remaining_budget_ms: remainingBudgetAtStart,
+          outcome: "503",
+          error_reason: `Retry skipped: insufficient deadline time (${Math.round(diagCollector.remainingMs / 1000)}s remaining, ${Math.round(MIN_REASONABLE_ATTEMPT_TIME_MS / 1000)}s needed)`,
+          retry_skipped_insufficient_time: true,
+        });
+        throw new UpstreamApiError(
+          `Gemini API retry skipped: insufficient time remaining before deadline (${Math.round(diagCollector.remainingMs / 1000)}s remaining).`,
+          504
+        );
+      }
     }
 
     const currentPhase = diagCollector?.activePhase || "initial_review";
@@ -298,10 +320,33 @@ export async function callModel(
     }
 
     // 3. Setup timeout and abort controller for this specific HTTP attempt
-    // Clamp timeout to remaining interactive deadline to avoid hanging past deadline
-    const attemptTimeoutMs = diagCollector
-      ? Math.min(configuredTimeoutMs, Math.max(1000, diagCollector.remainingMs - 1000))
-      : configuredTimeoutMs;
+    // Allocates attempt timeout dynamically based on remaining deadline and retries left
+    let attemptTimeoutMs = configuredTimeoutMs;
+    if (diagCollector) {
+      if (diagCollector.overallDeadlineMs > 5000) {
+        const retriesLeft = maxTransientRetries - attempt;
+        if (retriesLeft > 0) {
+          // Reserve time for a retry if this attempt hangs
+          const reserveForRetry = MIN_REASONABLE_ATTEMPT_TIME_MS + 2000;
+          const availableForThisAttempt = diagCollector.remainingMs - reserveForRetry;
+          const targetTimeout = Math.max(MIN_REASONABLE_ATTEMPT_TIME_MS, availableForThisAttempt);
+          attemptTimeoutMs =
+            optionsTimeout !== undefined
+              ? Math.min(optionsTimeout, targetTimeout)
+              : Math.min(configuredTimeoutMs, targetTimeout);
+        } else {
+          // Final retry attempt: allocate full remaining runway minus safety buffer
+          const maxRemaining = Math.max(1000, diagCollector.remainingMs - 2000);
+          attemptTimeoutMs =
+            optionsTimeout !== undefined
+              ? Math.min(optionsTimeout, maxRemaining)
+              : maxRemaining;
+        }
+      } else {
+        // Micro-test mode (e.g. 40ms or 50ms unit tests)
+        attemptTimeoutMs = Math.min(configuredTimeoutMs, Math.max(10, diagCollector.remainingMs - 5));
+      }
+    }
 
     const attemptController = new AbortController();
     let timeoutTimer: NodeJS.Timeout | null = null;
@@ -345,8 +390,10 @@ export async function callModel(
       if (effectiveSignal?.aborted) {
         diagCollector?.recordAttempt({
           attempt: attempt + 1,
+          model,
           phase: currentPhase,
           duration_ms: attemptDuration,
+          remaining_budget_ms: remainingBudgetAtStart,
           outcome: "aborted",
           error_reason: sanitizedErr,
         });
@@ -361,8 +408,10 @@ export async function callModel(
         if (budget && budget.isExhausted) {
           diagCollector?.recordAttempt({
             attempt: attempt + 1,
+            model,
             phase: currentPhase,
             duration_ms: attemptDuration,
+            remaining_budget_ms: remainingBudgetAtStart,
             outcome: "error",
             error_reason: "Request budget exhausted",
           });
@@ -375,24 +424,33 @@ export async function callModel(
           Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
 
         // In interactive mode, check if there is enough time left to sleep and make another attempt
-        if (diagCollector && diagCollector.overallDeadlineMs > 5000 && diagCollector.remainingMs < backoff + 3000) {
-          diagCollector.recordAttempt({
-            attempt: attempt + 1,
-            phase: currentPhase,
-            duration_ms: attemptDuration,
-            outcome: isTimeout ? "timeout" : "error",
-            error_reason: `${sanitizedErr} (insufficient time remaining for retry)`,
-          });
-          throw new UpstreamApiError(
-            `Gemini network attempt timed out: ${sanitizedErr} (cannot retry: deadline approaching)`,
-            504
-          );
+        if (diagCollector && diagCollector.overallDeadlineMs > 5000) {
+          const remainingAfterBackoff = diagCollector.remainingMs - backoff;
+          if (remainingAfterBackoff < MIN_REASONABLE_ATTEMPT_TIME_MS) {
+            diagCollector.retrySkippedDueToInsufficientTime = true;
+            diagCollector.recordAttempt({
+              attempt: attempt + 1,
+              model,
+              phase: currentPhase,
+              duration_ms: attemptDuration,
+              remaining_budget_ms: remainingBudgetAtStart,
+              outcome: isTimeout ? "timeout" : "network_error",
+              error_reason: `${sanitizedErr} (retry skipped: insufficient time remaining: ${Math.round(remainingAfterBackoff / 1000)}s left)`,
+              retry_skipped_insufficient_time: true,
+            });
+            throw new UpstreamApiError(
+              `Gemini network attempt ${isTimeout ? "timed out" : "failed"}: ${sanitizedErr} (cannot retry: deadline approaching)`,
+              504
+            );
+          }
         }
 
         diagCollector?.recordAttempt({
           attempt: attempt + 1,
+          model,
           phase: currentPhase,
           duration_ms: attemptDuration,
+          remaining_budget_ms: remainingBudgetAtStart,
           outcome: "transient_retry",
           error_reason: sanitizedErr,
           backoff_ms: Math.round(backoff),
@@ -407,9 +465,11 @@ export async function callModel(
 
       diagCollector?.recordAttempt({
         attempt: attempt + 1,
+        model,
         phase: currentPhase,
         duration_ms: attemptDuration,
-        outcome: isAborted || isTimeout ? "timeout" : "error",
+        remaining_budget_ms: remainingBudgetAtStart,
+        outcome: isAborted || isTimeout ? "timeout" : "network_error",
         error_reason: sanitizedErr,
       });
 
@@ -447,10 +507,12 @@ export async function callModel(
         const details = parse429Details(sanitizedError, response.headers);
         diagCollector?.recordAttempt({
           attempt: attempt + 1,
+          model,
           phase: currentPhase,
           duration_ms: attemptDuration,
+          remaining_budget_ms: remainingBudgetAtStart,
           status: 429,
-          outcome: "rate_limited",
+          outcome: "429",
           error_reason: sanitizedError,
         });
         throw new UpstreamApiError(
@@ -466,8 +528,10 @@ export async function callModel(
         if (effectiveSignal?.aborted) {
           diagCollector?.recordAttempt({
             attempt: attempt + 1,
+            model,
             phase: currentPhase,
             duration_ms: attemptDuration,
+            remaining_budget_ms: remainingBudgetAtStart,
             status: response.status,
             outcome: "aborted",
             error_reason: sanitizedError,
@@ -482,10 +546,12 @@ export async function callModel(
         if (budget && budget.isExhausted) {
           diagCollector?.recordAttempt({
             attempt: attempt + 1,
+            model,
             phase: currentPhase,
             duration_ms: attemptDuration,
+            remaining_budget_ms: remainingBudgetAtStart,
             status: response.status,
-            outcome: "error",
+            outcome: response.status === 503 ? "503" : "error",
             error_reason: "Request budget exhausted",
           });
           throw new UpstreamApiError(
@@ -502,25 +568,34 @@ export async function callModel(
         const backoff = Math.min(rawBackoff, maxBackoffMs);
 
         // Check if there is enough time left to sleep and retry
-        if (diagCollector && diagCollector.overallDeadlineMs > 5000 && diagCollector.remainingMs < backoff + 3000) {
-          diagCollector.recordAttempt({
-            attempt: attempt + 1,
-            phase: currentPhase,
-            duration_ms: attemptDuration,
-            status: response.status,
-            outcome: "error",
-            error_reason: `${sanitizedError} (insufficient time remaining for retry)`,
-          });
-          throw new UpstreamApiError(
-            `Gemini API call failed with status ${response.status}: ${sanitizedError} (cannot retry: deadline approaching)`,
-            response.status
-          );
+        if (diagCollector && diagCollector.overallDeadlineMs > 5000) {
+          const remainingAfterBackoff = diagCollector.remainingMs - backoff;
+          if (remainingAfterBackoff < MIN_REASONABLE_ATTEMPT_TIME_MS) {
+            diagCollector.retrySkippedDueToInsufficientTime = true;
+            diagCollector.recordAttempt({
+              attempt: attempt + 1,
+              model,
+              phase: currentPhase,
+              duration_ms: attemptDuration,
+              remaining_budget_ms: remainingBudgetAtStart,
+              status: response.status,
+              outcome: response.status === 503 ? "503" : "error",
+              error_reason: `${sanitizedError} (retry skipped: insufficient time remaining: ${Math.round(remainingAfterBackoff / 1000)}s left)`,
+              retry_skipped_insufficient_time: true,
+            });
+            throw new UpstreamApiError(
+              `Gemini API call failed with status ${response.status}: ${sanitizedError} (cannot retry: deadline approaching)`,
+              response.status
+            );
+          }
         }
 
         diagCollector?.recordAttempt({
           attempt: attempt + 1,
+          model,
           phase: currentPhase,
           duration_ms: attemptDuration,
+          remaining_budget_ms: remainingBudgetAtStart,
           status: response.status,
           outcome: "transient_retry",
           error_reason: sanitizedError,
@@ -536,10 +611,12 @@ export async function callModel(
 
       diagCollector?.recordAttempt({
         attempt: attempt + 1,
+        model,
         phase: currentPhase,
         duration_ms: attemptDuration,
+        remaining_budget_ms: remainingBudgetAtStart,
         status: response.status,
-        outcome: "error",
+        outcome: response.status === 503 ? "503" : "error",
         error_reason: sanitizedError,
       });
 
@@ -558,8 +635,10 @@ export async function callModel(
       const finishReason = candidate?.finishReason || "unknown";
       diagCollector?.recordAttempt({
         attempt: attempt + 1,
+        model,
         phase: currentPhase,
         duration_ms: attemptDuration,
+        remaining_budget_ms: remainingBudgetAtStart,
         status: 200,
         outcome: "error",
         error_reason: `Empty response (finishReason: ${finishReason})`,
@@ -569,8 +648,10 @@ export async function callModel(
 
     diagCollector?.recordAttempt({
       attempt: attempt + 1,
+      model,
       phase: currentPhase,
       duration_ms: attemptDuration,
+      remaining_budget_ms: remainingBudgetAtStart,
       status: 200,
       outcome: "success",
     });
