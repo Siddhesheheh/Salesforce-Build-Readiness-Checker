@@ -11,6 +11,13 @@ export type AttemptOutcome =
   | "aborted"
   | "error";
 
+export interface GeminiUsageMetadata {
+  promptTokenCount?: number;
+  candidatesTokenCount?: number;
+  totalTokenCount?: number;
+  thinkingTokenCount?: number;
+}
+
 export interface HttpAttemptTiming {
   attempt: number;
   model: string;
@@ -22,6 +29,8 @@ export interface HttpAttemptTiming {
   error_reason?: string;
   backoff_ms?: number;
   retry_skipped_insufficient_time?: boolean;
+  finish_reason?: string;
+  usage?: GeminiUsageMetadata;
 }
 
 /**
@@ -37,6 +46,7 @@ export class ReviewDiagnosticsCollector {
   schemaValidationRetries: number = 0;
   activePhase: "initial_review" | "schema_correction" = "initial_review";
   retrySkippedDueToInsufficientTime: boolean = false;
+  rateLimitCheckMs?: number;
 
   constructor(overallDeadlineMs: number = 90000, model: string = "unknown") {
     this.startTime = Date.now();
@@ -50,6 +60,28 @@ export class ReviewDiagnosticsCollector {
 
   get remainingMs(): number {
     return Math.max(0, this.overallDeadlineMs - this.elapsedMs);
+  }
+
+  get geminiTotalMs(): number {
+    return this.httpAttempts.reduce((sum, att) => sum + (att.duration_ms || 0), 0);
+  }
+
+  get latestUsage(): GeminiUsageMetadata | undefined {
+    for (let i = this.httpAttempts.length - 1; i >= 0; i--) {
+      if (this.httpAttempts[i].usage) {
+        return this.httpAttempts[i].usage;
+      }
+    }
+    return undefined;
+  }
+
+  get latestFinishReason(): string | undefined {
+    for (let i = this.httpAttempts.length - 1; i >= 0; i--) {
+      if (this.httpAttempts[i].finish_reason) {
+        return this.httpAttempts[i].finish_reason;
+      }
+    }
+    return undefined;
   }
 
   recordAttempt(timing: HttpAttemptTiming): void {

@@ -195,6 +195,33 @@ export interface CallModelOptions {
   sleepFn?: (ms: number) => Promise<void>;
   timeoutMs?: number;           // default: 30000 (30 seconds per attempt)
   signal?: AbortSignal;
+  thinkingLevel?: "low" | "medium" | "high" | "off" | null;
+}
+
+/**
+ * Validates and resolves the thinkingLevel for Gemini 3.x Flash models.
+ * Returns undefined if thinking is not configured or unsupported.
+ */
+export function resolveThinkingLevel(
+  model: string,
+  configuredLevel?: string | null
+): "low" | "medium" | "high" | undefined {
+  const raw = (configuredLevel ?? process.env.GEMINI_THINKING_LEVEL)?.trim().toLowerCase();
+  if (!raw || raw === "off" || raw === "none" || raw === "unspecified") {
+    return undefined;
+  }
+
+  // Only Gemini 3.x models currently support the thinkingConfig schema
+  const isGemini3 = /^gemini-3\./i.test(model);
+  if (!isGemini3) {
+    return undefined;
+  }
+
+  if (raw === "low" || raw === "medium" || raw === "high") {
+    return raw;
+  }
+
+  return undefined;
 }
 
 /**
@@ -234,9 +261,23 @@ export async function callModel(
     sleepFn = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms)),
     timeoutMs: optionsTimeout,
     signal: externalSignal,
+    thinkingLevel: optionsThinkingLevel,
   } = options;
 
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+  const resolvedThinking = resolveThinkingLevel(model, optionsThinkingLevel);
+
+  const generationConfig: any = {
+    temperature: 0.2,
+    responseMimeType: "application/json",
+  };
+
+  if (resolvedThinking) {
+    generationConfig.thinkingConfig = {
+      thinkingLevel: resolvedThinking,
+    };
+  }
 
   const payload = {
     systemInstruction: {
@@ -248,10 +289,7 @@ export async function callModel(
         parts: [{ text: user }],
       },
     ],
-    generationConfig: {
-      temperature: 0.2,
-      responseMimeType: "application/json",
-    },
+    generationConfig,
   };
 
   const bodyStr = JSON.stringify(payload);
@@ -630,9 +668,23 @@ export async function callModel(
     const attemptDuration = Date.now() - attemptStart;
     const data = await response.json();
     const candidate = data?.candidates?.[0];
+    const finishReason = candidate?.finishReason || "unknown";
+
+    // Extract usageMetadata when provided by Gemini
+    const rawUsage = data?.usageMetadata;
+    const usage = rawUsage
+      ? {
+          promptTokenCount: rawUsage.promptTokenCount,
+          candidatesTokenCount: rawUsage.candidatesTokenCount,
+          totalTokenCount: rawUsage.totalTokenCount,
+          thinkingTokenCount:
+            rawUsage.candidatesTokensDetails?.find?.((d: any) => d.modality === "THINKING")?.tokenCount ??
+            rawUsage.thoughtsTokenCount ??
+            rawUsage.thinkingTokenCount,
+        }
+      : undefined;
 
     if (!candidate || !candidate.content?.parts?.[0]?.text) {
-      const finishReason = candidate?.finishReason || "unknown";
       diagCollector?.recordAttempt({
         attempt: attempt + 1,
         model,
@@ -642,6 +694,8 @@ export async function callModel(
         status: 200,
         outcome: "error",
         error_reason: `Empty response (finishReason: ${finishReason})`,
+        finish_reason: finishReason,
+        usage,
       });
       throw new UpstreamApiError(`Gemini returned empty response (finishReason: ${finishReason})`);
     }
@@ -654,6 +708,8 @@ export async function callModel(
       remaining_budget_ms: remainingBudgetAtStart,
       status: 200,
       outcome: "success",
+      finish_reason: finishReason,
+      usage,
     });
 
     const rawText = candidate.content.parts[0].text;

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
-import { callModel } from "../lib/llm";
+import { callModel, resolveThinkingLevel } from "../lib/llm";
 
 describe("lib/llm: callModel", () => {
   const originalEnv = { ...process.env };
@@ -257,5 +257,81 @@ describe("lib/llm: callModel", () => {
     expect(mockSleep).toHaveBeenCalledOnce();
     const sleptMs = mockSleep.mock.calls[0][0];
     expect(sleptMs).toBeLessThanOrEqual(5000); // Must be capped, not 60000ms!
+  });
+
+  describe("resolveThinkingLevel & thinkingConfig construction", () => {
+    it("resolves thinking level from options or environment for Gemini 3.x", () => {
+      expect(resolveThinkingLevel("gemini-3.8-flash", "low")).toBe("low");
+      expect(resolveThinkingLevel("gemini-3.8-flash", "medium")).toBe("medium");
+      expect(resolveThinkingLevel("gemini-3.8-flash", "high")).toBe("high");
+      expect(resolveThinkingLevel("gemini-3.8-flash", "off")).toBeUndefined();
+      expect(resolveThinkingLevel("gemini-3.8-flash", "invalid")).toBeUndefined();
+      expect(resolveThinkingLevel("gemini-2.5-flash", "low")).toBeUndefined(); // Only Gemini 3.x
+
+      process.env.GEMINI_THINKING_LEVEL = "low";
+      expect(resolveThinkingLevel("gemini-3.8-flash")).toBe("low");
+
+      process.env.GEMINI_THINKING_LEVEL = "off";
+      expect(resolveThinkingLevel("gemini-3.8-flash")).toBeUndefined();
+    });
+
+    it("includes thinkingConfig in payload when configured", async () => {
+      let capturedBody: any = null;
+      const mockFetch = vi.fn().mockImplementation((_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: { parts: [{ text: '{"status":"ok"}' }] },
+                finishReason: "STOP",
+              },
+            ],
+          }),
+        });
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      await callModel("sys", "user", {
+        model: "gemini-3.8-flash",
+        thinkingLevel: "low",
+      });
+
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody.generationConfig?.thinkingConfig).toEqual({
+        thinkingLevel: "low",
+      });
+      expect(capturedBody.generationConfig?.responseMimeType).toBe("application/json");
+    });
+
+    it("omits thinkingConfig when thinkingLevel is not configured or unsupported", async () => {
+      delete process.env.GEMINI_THINKING_LEVEL;
+      let capturedBody: any = null;
+      const mockFetch = vi.fn().mockImplementation((_url, opts) => {
+        capturedBody = JSON.parse(opts.body);
+        return Promise.resolve({
+          ok: true,
+          status: 200,
+          json: async () => ({
+            candidates: [
+              {
+                content: { parts: [{ text: '{"status":"ok"}' }] },
+                finishReason: "STOP",
+              },
+            ],
+          }),
+        });
+      });
+      vi.stubGlobal("fetch", mockFetch);
+
+      await callModel("sys", "user", {
+        model: "gemini-3.8-flash",
+      });
+
+      expect(capturedBody).toBeDefined();
+      expect(capturedBody.generationConfig?.thinkingConfig).toBeUndefined();
+    });
   });
 });

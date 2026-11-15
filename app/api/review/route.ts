@@ -22,7 +22,9 @@ export async function POST(req: NextRequest) {
   try {
     const clientIp = req.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "127.0.0.1";
 
+    const rateLimitStart = Date.now();
     const rateLimitResult = await checkRateLimit(clientIp);
+    const rateLimitCheckMs = Date.now() - rateLimitStart;
     if (rateLimitResult.limited) {
       if (rateLimitResult.source === "fail_closed") {
         return NextResponse.json<ReviewErrorResponse>(
@@ -142,6 +144,7 @@ export async function POST(req: NextRequest) {
       defaultDeadlineMs;
     const modelName = resolveModelName();
     diagnostics = new ReviewDiagnosticsCollector(overallDeadlineMs, modelName);
+    diagnostics.rateLimitCheckMs = rateLimitCheckMs;
     let deadlineTimer: NodeJS.Timeout | null = null;
     const overallAbortController = new AbortController();
 
@@ -181,6 +184,8 @@ export async function POST(req: NextRequest) {
       JSON.stringify({
         event: "review_completed",
         model: diagnostics.model,
+        rate_limit_check_ms: diagnostics.rateLimitCheckMs ?? rateLimitCheckMs,
+        gemini_total_ms: diagnostics.geminiTotalMs,
         req_length: trimmedReq.length,
         org_context_length: org_context ? org_context.length : 0,
         verdict: report.readiness_verdict,
@@ -190,6 +195,8 @@ export async function POST(req: NextRequest) {
         http_attempts_count: diagnostics.httpAttempts.length,
         schema_validation_retries: diagnostics.schemaValidationRetries,
         retry_skipped_insufficient_time: diagnostics.retrySkippedDueToInsufficientTime,
+        finish_reason: diagnostics.latestFinishReason,
+        usage: diagnostics.latestUsage,
         attempts: diagnostics.httpAttempts,
       })
     );
@@ -204,6 +211,8 @@ export async function POST(req: NextRequest) {
       JSON.stringify({
         event: "review_failed",
         model: diagnostics?.model || resolveModelName(),
+        rate_limit_check_ms: diagnostics?.rateLimitCheckMs,
+        gemini_total_ms: diagnostics?.geminiTotalMs ?? 0,
         total_duration_ms: latencyMs,
         error_name: error?.name,
         error_message: sanitizedErrorMsg,
@@ -212,6 +221,8 @@ export async function POST(req: NextRequest) {
         http_attempts_count: diagnostics?.httpAttempts?.length ?? 0,
         schema_validation_retries: diagnostics?.schemaValidationRetries ?? 0,
         retry_skipped_insufficient_time: diagnostics?.retrySkippedDueToInsufficientTime ?? false,
+        finish_reason: diagnostics?.latestFinishReason,
+        usage: diagnostics?.latestUsage,
         attempts: diagnostics?.httpAttempts ?? [],
       })
     );
