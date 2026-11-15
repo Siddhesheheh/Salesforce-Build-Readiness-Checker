@@ -4,6 +4,20 @@ import Ajv from "ajv";
 import { callModel, UpstreamApiError, BudgetExceededError, MIN_REASONABLE_ATTEMPT_TIME_MS } from "./llm";
 import { Finding, ReadinessReport, ReadinessVerdict, Severity } from "./types";
 import { reviewAbortContext, reviewDiagnosticsContext } from "./request-context";
+import {
+  normalizeEvidenceQuotes,
+  evaluateEvidence,
+  verifyAndNormalizeEvidence,
+  EvidenceType,
+  EvaluatedEvidence,
+} from "./evidence";
+
+export {
+  normalizeEvidenceQuotes,
+  evaluateEvidence,
+  verifyAndNormalizeEvidence,
+};
+export type { EvidenceType, EvaluatedEvidence };
 
 let cachedRubric: string | null = null;
 let cachedSchemaString: string | null = null;
@@ -38,7 +52,32 @@ export function buildSystemPrompt(): string {
   const rubric = getRubric();
   const schemaStr = getSchemaString();
 
-  return `${rubric}\n\n## Target JSON Schema (schema.json)\nYou MUST return a JSON object that adheres strictly to the following JSON schema definition. Ensure all required fields, exact property names, types, and enum values are used:\n\`\`\`json\n${schemaStr}\n\`\`\``;
+  return `${rubric}
+
+## Additional Quality, Evidence & Severity Calibration Directives
+Follow these rules strictly to ensure trustworthiness and eliminate review defects:
+1. **Evidence Integrity (DEF-01, DEF-04)**:
+   - For direct quotes, \`evidence\` MUST be an EXACT, verbatim substring copied directly from the supplied REQUIREMENT text. Never paraphrase, alter capitalization, or invent wording.
+   - Do NOT wrap your \`evidence\` string in extra outer quotation marks (the display UI formats it).
+   - For missing requirements/omissions, prefix with \`Not stated — \` followed by the nearest exact related sentence or phrase from the requirement. If the requirement has no related statement at all, write exactly \`Not stated in requirement\`.
+2. **Category 7 Org Impact Calibration (DEF-05)**:
+   - When ORG CONTEXT is "None provided", do NOT automatically generate an Important or Blocker finding solely because org context is absent.
+   - Only raise a Category 7 finding when the requirement describes a concrete dependency on or collision with existing Salesforce architecture (e.g., modifying standard objects like Lead/Opportunity/Case, active Flows, Apex triggers, validation rules, managed packages, Experience Cloud, or security sharing model). If the requirement is self-contained or Greenfield custom objects, mark Category 7 as "Covered" or "Not applicable" without inventing an artificial finding.
+3. **Severity Calibration & Non-Anchoring (DEF-06, DEF-07)**:
+   - Severity MUST be calibrated by real implementation risk and potential rework:
+     * **Blocker**: A critical unresolved business logic, data model, security, or integration decision that will cause an incorrect implementation or prevent building.
+     * **Important**: A material ambiguity that risks rework or failed acceptance testing (e.g. unstated error paths, undefined threshold rules, conflicting automations).
+     * **Minor**: A small configuration detail that can be safely finalized during implementation without changing business logic (e.g. template API name, label, standard task subject).
+   - Do NOT anchor your findings to a fixed count distribution. If a requirement has 0 Blockers, return 0 Blockers. If it is already complete, return 0 findings and mark "Ready to build".
+4. **Scope Control & No Unrequested Features (DEF-08)**:
+   - Only report gaps required to build or validate the user's STATED functionality and its direct technical dependencies.
+   - Never invent unrequested features, multi-step approval workflows, notification bells, audit frameworks, or third-party integrations that the stakeholder never asked for.
+
+## Target JSON Schema (schema.json)
+You MUST return a JSON object that adheres strictly to the following JSON schema definition. Ensure all required fields, exact property names, types, and enum values are used:
+\`\`\`json
+${schemaStr}
+\`\`\``;
 }
 
 const SEVERITY_ORDER: Record<Severity, number> = {
@@ -241,5 +280,6 @@ export async function reviewRequirement(
   }
 
   const validatedReport = parsed as ReadinessReport;
-  return computeVerdictAndCounts(validatedReport);
+  const verifiedReport = verifyAndNormalizeEvidence(validatedReport, requirement);
+  return computeVerdictAndCounts(verifiedReport);
 }

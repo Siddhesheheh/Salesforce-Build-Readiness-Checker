@@ -517,3 +517,139 @@ describe("Frontend: Navbar & Footer", () => {
     expect(html).toContain("Zero Data Retention");
   });
 });
+
+describe("Frontend: Findings Trustworthiness & UI Enhancements (DEF-01, DEF-02, DEF-03, DEF-04)", () => {
+  const requirementText = "When a new Lead is created with Lead Score greater than 80, assign to Enterprise SDR queue.";
+
+  const testReport: ReadinessReport = {
+    summary: "Evaluation summary",
+    readiness_verdict: "Needs clarification",
+    counts: { blockers: 0, important: 2, minor: 0, questions: 2 },
+    category_status: [
+      { category: "Business rules", status: "Covered" },
+      { category: "Access, permissions and test access", status: "Partial" },
+      { category: "Data fields and quality", status: "Covered" },
+      { category: "Data model and relationships", status: "Covered" },
+      { category: "Exceptions and edge cases", status: "Missing" },
+      { category: "Integrations, migration and scale", status: "Not applicable" },
+      { category: "Current process and existing org impact", status: "Covered" },
+      { category: "Automation behavior", status: "Covered" },
+      { category: "Reporting and visibility", status: "Covered" },
+      { category: "Acceptance and sign-off", status: "Missing" },
+    ],
+    findings: [
+      {
+        id: 1,
+        title: "Missing fallback queue",
+        category: "Business rules",
+        severity: "Important",
+        evidence: '""assign to Enterprise SDR queue""', // Raw doubled quotes
+        whats_missing: "Fallback queue not specified",
+        why_it_matters: "Unrouted leads fail",
+        question_for_pm: "What is the fallback queue?",
+        verify_in_org: "Check queues",
+      },
+      {
+        id: 2,
+        title: "Undefined security access",
+        category: "Access, permissions and test access",
+        severity: "Important",
+        evidence: "Not stated — Profile and permission set requirements",
+        whats_missing: "Permission sets omitted",
+        why_it_matters: "SDRs cannot access leads",
+        question_for_pm: "Which permission set is needed?",
+        verify_in_org: "Check permission sets",
+      },
+    ],
+  };
+
+  it("DEF-01: cleans doubled evidence quotes and renders without redundant outer quotes", () => {
+    const html = renderToStaticMarkup(
+      <ResultsView
+        report={testReport}
+        requirement={requirementText}
+      />
+    );
+
+    // Finding 1 evidence was raw doubled quotes: '""assign to Enterprise SDR queue""'
+    // It should render cleanly as “assign to Enterprise SDR queue” without “"..."”
+    expect(html).toContain("Verified Quote");
+    expect(html).toContain("assign to Enterprise SDR queue");
+    expect(html).not.toContain("&ldquo;&quot;");
+    expect(html).not.toContain("“\"");
+    expect(html).not.toContain("\"”");
+
+    // Finding 2 is an omission statement: should render with omission label and badge, not wrapped in quotes
+    expect(html).toContain("Unstated in requirement");
+    expect(html).toContain("Requirement Omission (Unstated):");
+    expect(html).toContain("Not stated — Profile and permission set requirements");
+  });
+
+  it("DEF-02: renders responsive header container and keeps action controls accessible", () => {
+    const html = renderToStaticMarkup(
+      <ResultsView
+        report={testReport}
+        requirement={requirementText}
+      />
+    );
+
+    // Header layout should use responsive flex-col sm:flex-row with min-w-0 and break-words
+    expect(html).toContain("flex flex-col sm:flex-row sm:items-center justify-between gap-3");
+    expect(html).toContain("break-words max-w-full");
+    expect(html).toContain("shrink-0 self-end sm:self-auto");
+
+    // Thumbs up/down controls and copy question remain fully accessible
+    expect(html).toContain("Rate Finding #1 as Useful");
+    expect(html).toContain("Rate Finding #1 as Not Useful");
+    expect(html).toContain("Copy Question");
+  });
+
+  it("DEF-03: renders interactive category cards with finding counts and omission notices", () => {
+    const html = renderToStaticMarkup(
+      <ResultsView
+        report={testReport}
+        requirement={requirementText}
+      />
+    );
+
+    // Category cards render as buttons with aria-pressed
+    expect(html).toContain('aria-pressed="false"');
+
+    // Finding count badges on categories with findings
+    expect(html).toContain("1 finding");
+
+    // Categories with status Missing or Partial and 0 findings explain that no individual finding was generated
+    expect(html).toContain("Omission noted in rubric; no individual finding generated");
+  });
+
+  it("visibly distinguishes unverified/paraphrased references without verified quotes", () => {
+    const unverifiedReport: ReadinessReport = {
+      ...testReport,
+      findings: [
+        {
+          id: 3,
+          title: "Paraphrased finding",
+          category: "Business rules",
+          severity: "Important",
+          evidence: "Leads with score above 80 route to enterprise SDRs", // Paraphrased from requirement
+          whats_missing: "Condition missing",
+          why_it_matters: "Routing fails",
+          question_for_pm: "Clarify routing?",
+          verify_in_org: "",
+        },
+      ],
+    };
+
+    const html = renderToStaticMarkup(
+      <ResultsView
+        report={unverifiedReport}
+        requirement={requirementText}
+      />
+    );
+
+    expect(html).toContain("Unverified Reference");
+    expect(html).toContain("Evidence Reference:");
+    expect(html).toContain("(not found verbatim in requirement)");
+    expect(html).not.toContain("Verified Quote");
+  });
+});

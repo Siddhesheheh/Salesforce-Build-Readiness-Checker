@@ -5,6 +5,9 @@ import {
   buildSystemPrompt,
   reviewRequirement,
   ReviewDiagnostics,
+  normalizeEvidenceQuotes,
+  evaluateEvidence,
+  verifyAndNormalizeEvidence,
 } from "../lib/review";
 import { UpstreamApiError } from "../lib/llm";
 import { ReadinessReport, Finding } from "../lib/types";
@@ -263,5 +266,143 @@ describe("lib/review: reviewRequirement execution and retry logic", () => {
 
     // Assert that it did NOT trigger a schema correction retry on an upstream API failure
     expect(callCount).toBe(1);
+  });
+});
+
+describe("Evidence Normalization and Deterministic Verification (DEF-01, DEF-04)", () => {
+  it("normalizes evidence outer quotation marks while preserving internal quotes", () => {
+    // Outer ASCII double quotes
+    expect(normalizeEvidenceQuotes('"Leads with score > 80"')).toBe("Leads with score > 80");
+    // Outer ASCII single quotes
+    expect(normalizeEvidenceQuotes("'Leads with score > 80'")).toBe("Leads with score > 80");
+    // Outer typographic quotes
+    expect(normalizeEvidenceQuotes("“Leads with score > 80”")).toBe("Leads with score > 80");
+    // Doubled outer quotes
+    expect(normalizeEvidenceQuotes('""Leads with score > 80""')).toBe("Leads with score > 80");
+    // Preserves internal quotes
+    expect(normalizeEvidenceQuotes('"Status is set to \'Open - Not Contacted\'"')).toBe(
+      "Status is set to 'Open - Not Contacted'"
+    );
+    // Preserves unquoted text
+    expect(normalizeEvidenceQuotes("Leads with score > 80")).toBe("Leads with score > 80");
+    // Empty or undefined handling
+    expect(normalizeEvidenceQuotes("")).toBe("");
+  });
+
+  it("evaluates evidence deterministically against source requirement", () => {
+    const requirement =
+      "When a new Lead is created with Lead Score greater than 80, assign to Enterprise SDR queue. If score <= 80, assign to Inbound SDR queue.";
+
+    // Verbatim quote match
+    const verbatimResult = evaluateEvidence(
+      "Lead Score greater than 80",
+      requirement
+    );
+    expect(verbatimResult.type).toBe("verbatim");
+    expect(verbatimResult.isVerbatim).toBe(true);
+    expect(verbatimResult.isOmission).toBe(false);
+    expect(verbatimResult.cleanText).toBe("Lead Score greater than 80");
+
+    // Verbatim quote with outer quotes
+    const quotedVerbatimResult = evaluateEvidence(
+      '"assign to Enterprise SDR queue"',
+      requirement
+    );
+    expect(quotedVerbatimResult.type).toBe("verbatim");
+    expect(quotedVerbatimResult.isVerbatim).toBe(true);
+    expect(quotedVerbatimResult.cleanText).toBe("assign to Enterprise SDR queue");
+
+    // Explicit omission statement
+    const omissionResult = evaluateEvidence(
+      "Not stated — Fallback queue when no SDR is available",
+      requirement
+    );
+    expect(omissionResult.type).toBe("omission");
+    expect(omissionResult.isOmission).toBe(true);
+    expect(omissionResult.isVerbatim).toBe(false);
+
+    // Paraphrased or unverified quote
+    const paraphrasedResult = evaluateEvidence(
+      "Leads above eighty points go to enterprise",
+      requirement
+    );
+    expect(paraphrasedResult.type).toBe("unverified");
+    expect(paraphrasedResult.isVerbatim).toBe(false);
+    expect(paraphrasedResult.isOmission).toBe(false);
+    expect(paraphrasedResult.cleanText).toBe("Leads above eighty points go to enterprise");
+
+    // Completely empty evidence falls back to omission
+    const emptyResult = evaluateEvidence("", requirement);
+    expect(emptyResult.type).toBe("omission");
+    expect(emptyResult.cleanText).toBe("Not stated in requirement");
+
+    // Missing requirement text NEVER treats quote as verified
+    const noReqResult = evaluateEvidence("Lead Score greater than 80", "");
+    expect(noReqResult.type).toBe("unverified");
+    expect(noReqResult.isVerbatim).toBe(false);
+
+    // Micro substrings (< 3 chars) do not qualify as verified verbatim quotes
+    const shortResult = evaluateEvidence("a", requirement);
+    expect(shortResult.type).toBe("unverified");
+    expect(shortResult.isVerbatim).toBe(false);
+
+    // Varied omission phrasing correctly recognized
+    expect(evaluateEvidence("Not specified in user story", requirement).isOmission).toBe(true);
+    expect(evaluateEvidence("None provided by product team", requirement).isOmission).toBe(true);
+    expect(evaluateEvidence("Missing from requirements document", requirement).isOmission).toBe(true);
+  });
+
+  it("verifyAndNormalizeEvidence normalizes findings across a full report", () => {
+    const requirement = "Send email reminder 30 days before renewal date.";
+    const report: ReadinessReport = {
+      summary: "Sample",
+      readiness_verdict: "Needs clarification",
+      counts: { blockers: 0, important: 1, minor: 1, questions: 2 },
+      category_status: mockCategoryStatus,
+      findings: [
+        createMockFinding({
+          evidence: '""Send email reminder 30 days before renewal date.""',
+        }),
+        createMockFinding({
+          evidence: "Not stated — Sender display name and email address",
+        }),
+        createMockFinding({
+          evidence: "",
+        }),
+      ],
+    };
+
+    const verified = verifyAndNormalizeEvidence(report, requirement);
+    expect(verified.findings[0].evidence).toBe("Send email reminder 30 days before renewal date.");
+    expect(verified.findings[1].evidence).toBe("Not stated — Sender display name and email address");
+    expect(verified.findings[2].evidence).toBe("Not stated in requirement");
+
+    // Severity, counts, and verdict remain unchanged by evidence normalization
+    expect(verified.findings[0].severity).toBe("Minor");
+    expect(verified.counts).toEqual(report.counts);
+    expect(verified.readiness_verdict).toBe(report.readiness_verdict);
+  });
+});
+
+describe("System Prompt Calibration Directives (DEF-05 to DEF-08)", () => {
+  it("includes Category 7 Org Impact calibration directive (DEF-05)", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).toContain("Category 7 Org Impact Calibration (DEF-05)");
+    expect(prompt).toContain('When ORG CONTEXT is "None provided", do NOT automatically generate');
+  });
+
+  it("includes Severity Calibration and Non-Anchoring directives (DEF-06, DEF-07)", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).toContain("Severity Calibration & Non-Anchoring (DEF-06, DEF-07)");
+    expect(prompt).toContain("Blocker");
+    expect(prompt).toContain("Important");
+    expect(prompt).toContain("Minor");
+    expect(prompt).toContain("Do NOT anchor your findings to a fixed count distribution");
+  });
+
+  it("includes Scope Control & No Unrequested Features directive (DEF-08)", () => {
+    const prompt = buildSystemPrompt();
+    expect(prompt).toContain("Scope Control & No Unrequested Features (DEF-08)");
+    expect(prompt).toContain("Never invent unrequested features");
   });
 });

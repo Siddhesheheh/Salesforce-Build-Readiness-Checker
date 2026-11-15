@@ -2,6 +2,7 @@
 
 import React, { useState } from "react";
 import { Finding, Severity } from "@/lib/types";
+import { evaluateEvidence } from "@/lib/evidence";
 import {
   FindingFeedback,
   FindingRating,
@@ -86,6 +87,7 @@ export function ResultsView({
   const [copiedAll, setCopiedAll] = useState<boolean>(false);
   const [copiedFindingId, setCopiedFindingId] = useState<number | null>(null);
   const [severityFilter, setSeverityFilter] = useState<string>("ALL");
+  const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
   const [activeAnswerId, setActiveAnswerId] = useState<number | null>(null);
   const [editingAnswerText, setEditingAnswerText] = useState<string>("");
   const [showClearConfirm, setShowClearConfirm] = useState<boolean>(false);
@@ -225,9 +227,19 @@ export function ResultsView({
     });
   };
 
+  const matchesCategory = (findingCat: string, targetCat: string) => {
+    const f = (findingCat || "").toLowerCase().trim();
+    const t = (targetCat || "").toLowerCase().trim();
+    if (f === t) return true;
+    const fClean = f.replace(/^\d+[\.\s\-]+/, "").trim();
+    const tClean = t.replace(/^\d+[\.\s\-]+/, "").trim();
+    return fClean === tClean || f.includes(tClean) || t.includes(fClean);
+  };
+
   const filteredFindings = report.findings.filter((f) => {
-    if (severityFilter === "ALL") return true;
-    return f.severity === severityFilter;
+    if (severityFilter !== "ALL" && f.severity !== severityFilter) return false;
+    if (selectedCategory && !matchesCategory(f.category, selectedCategory)) return false;
+    return true;
   });
 
   const getSeverityBadgeClass = (severity: Severity) => {
@@ -506,17 +518,48 @@ export function ResultsView({
         </div>
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-5 gap-3">
-          {report.category_status.map((item) => (
-            <div
-              key={item.category}
-              className="p-3 rounded-xl border border-white/[0.04] bg-white/[0.02] flex flex-col justify-between space-y-2"
-            >
-              <span className="text-xs font-medium text-zinc-300 leading-snug line-clamp-2">
-                {item.category}
-              </span>
-              <div>{getCategoryStatusBadge(item.status)}</div>
-            </div>
-          ))}
+          {report.category_status.map((item) => {
+            const count = report.findings.filter((f) => matchesCategory(f.category, item.category)).length;
+            const isSelected = selectedCategory === item.category;
+
+            return (
+              <button
+                key={item.category}
+                type="button"
+                onClick={() => setSelectedCategory(isSelected ? null : item.category)}
+                aria-pressed={isSelected}
+                className={`p-3 rounded-xl border text-left flex flex-col justify-between space-y-2 transition-all cursor-pointer ${
+                  isSelected
+                    ? "border-blue-500/60 bg-blue-500/10 ring-1 ring-blue-500/40"
+                    : "border-white/[0.04] bg-white/[0.02] hover:border-white/[0.12] hover:bg-white/[0.04]"
+                }`}
+              >
+                <div className="space-y-1 w-full">
+                  <div className="flex items-start justify-between gap-1.5">
+                    <span className="text-xs font-medium text-zinc-300 leading-snug line-clamp-2">
+                      {item.category}
+                    </span>
+                    {count > 0 && (
+                      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-blue-500/20 text-blue-300 border border-blue-500/30 shrink-0">
+                        {count} {count === 1 ? "finding" : "findings"}
+                      </span>
+                    )}
+                  </div>
+                  {count === 0 && (item.status === "Missing" || item.status === "Partial") && (
+                    <p className="text-[10px] text-zinc-500 leading-tight">
+                      Omission noted in rubric; no individual finding generated
+                    </p>
+                  )}
+                </div>
+                <div className="flex items-center justify-between w-full pt-1">
+                  <div>{getCategoryStatusBadge(item.status)}</div>
+                  <span className="text-[10px] text-zinc-500 hover:text-zinc-300">
+                    {isSelected ? "Active" : count > 0 ? "Filter" : ""}
+                  </span>
+                </div>
+              </button>
+            );
+          })}
         </div>
       </section>
 
@@ -583,6 +626,26 @@ export function ResultsView({
           )}
         </div>
 
+        {/* Active category filter pill */}
+        {selectedCategory && (
+          <div className="flex items-center justify-between bg-blue-950/20 border border-blue-500/30 px-4 py-2.5 rounded-xl text-xs text-blue-200">
+            <div className="flex items-center space-x-2">
+              <span className="font-semibold text-blue-400">Category Filter:</span>
+              <span>{selectedCategory}</span>
+              <span className="text-blue-300/70">
+                ({filteredFindings.length} {filteredFindings.length === 1 ? "finding" : "findings"})
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSelectedCategory(null)}
+              className="text-xs text-blue-400 hover:text-blue-200 font-semibold underline ml-3 cursor-pointer"
+            >
+              Clear filter
+            </button>
+          </div>
+        )}
+
         {/* Empty State */}
         {report.findings.length === 0 ? (
           <div className="bg-emerald-950/20 border border-emerald-500/30 rounded-2xl p-8 text-center space-y-3">
@@ -595,6 +658,43 @@ export function ResultsView({
             <p className="text-xs sm:text-sm text-emerald-300/80 max-w-lg mx-auto">
               This requirement specification satisfies all 10 rubric categories. Ready for developer kickoff.
             </p>
+          </div>
+        ) : filteredFindings.length === 0 ? (
+          <div className="bg-[#0f1115] border border-white/[0.08] rounded-2xl p-6 text-center space-y-3">
+            <p className="text-zinc-300 text-sm font-medium">
+              {selectedCategory
+                ? `No individual finding generated for "${selectedCategory}"`
+                : `No findings matching the selected filter`}
+            </p>
+            {selectedCategory && (
+              <p className="text-zinc-400 text-xs max-w-xl mx-auto leading-relaxed">
+                Rubric status for this category is{" "}
+                <strong className="text-zinc-200">
+                  {report.category_status.find((c: any) => matchesCategory(c.category, selectedCategory))?.status || "evaluated"}
+                </strong>
+                . This criterion was evaluated during the review, but no separate blocker or clarification finding was raised.
+              </p>
+            )}
+            <div className="flex items-center justify-center gap-2 pt-1">
+              {selectedCategory && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedCategory(null)}
+                  className="text-xs px-3.5 py-1.5 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.1] rounded-lg text-zinc-200 cursor-pointer"
+                >
+                  Clear Category Filter
+                </button>
+              )}
+              {severityFilter !== "ALL" && (
+                <button
+                  type="button"
+                  onClick={() => setSeverityFilter("ALL")}
+                  className="text-xs px-3.5 py-1.5 bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.1] rounded-lg text-zinc-200 cursor-pointer"
+                >
+                  Clear Severity Filter
+                </button>
+              )}
+            </div>
           </div>
         ) : (
           <div className="space-y-4">
@@ -610,25 +710,25 @@ export function ResultsView({
                   className="bg-[#0f1115] rounded-2xl border border-white/[0.08] shadow-lg overflow-hidden"
                 >
                   {/* Finding Card Header */}
-                  <div className="bg-white/[0.02] border-b border-white/[0.06] px-6 py-3.5 flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex items-center space-x-2.5">
-                      <span className="text-xs font-bold text-zinc-500 font-mono">
+                  <div className="bg-white/[0.02] border-b border-white/[0.06] px-4 sm:px-6 py-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                    <div className="flex flex-wrap items-center gap-2 min-w-0">
+                      <span className="text-xs font-bold text-zinc-500 font-mono shrink-0">
                         #{finding.id}
                       </span>
                       <span
-                        className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border ${getSeverityBadgeClass(
+                        className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium border shrink-0 ${getSeverityBadgeClass(
                           finding.severity
                         )}`}
                       >
                         {finding.severity}
                       </span>
-                      <span className="text-xs font-medium text-zinc-400 bg-white/[0.04] border border-white/[0.06] px-2.5 py-0.5 rounded-full">
+                      <span className="text-xs font-medium text-zinc-400 bg-white/[0.04] border border-white/[0.06] px-2.5 py-0.5 rounded-full break-words max-w-full">
                         {finding.category}
                       </span>
                     </div>
 
                     {/* Controls: Thumbs Up/Down Feedback + Copy Question */}
-                    <div className="flex items-center space-x-2">
+                    <div className="flex items-center space-x-2 shrink-0 self-end sm:self-auto">
                       {/* PART A: Finding Feedback Controls */}
                       <div className="flex items-center space-x-1 bg-[#161920] px-1.5 py-1 rounded-lg border border-white/[0.08]">
                         <button
@@ -767,13 +867,51 @@ export function ResultsView({
                       {finding.title}
                     </h3>
 
-                    {/* Evidence quote */}
-                    <div className="bg-white/[0.02] border-l-2 border-zinc-600 px-4 py-2.5 rounded-r-lg text-xs sm:text-sm text-zinc-300 italic">
-                      <span className="font-semibold not-italic text-zinc-400 block text-[11px] uppercase tracking-wider mb-0.5">
-                        Evidence from Requirement:
-                      </span>
-                      &ldquo;{finding.evidence}&rdquo;
-                    </div>
+                    {/* Evidence quote / omission rendering */}
+                    {(() => {
+                      const sourceReq =
+                        currentVersion.submittedRequirement || legacyReq || session.originalRequirement || "";
+                      const evaluated = evaluateEvidence(finding.evidence, sourceReq);
+
+                      return (
+                        <div className="bg-white/[0.02] border-l-2 border-zinc-600 px-4 py-2.5 rounded-r-lg text-xs sm:text-sm text-zinc-300 italic">
+                          <div className="flex items-center justify-between gap-2 mb-1 not-italic">
+                            <span className="font-semibold text-zinc-400 text-[11px] uppercase tracking-wider">
+                              {evaluated.isOmission
+                                ? "Requirement Omission (Unstated):"
+                                : evaluated.isVerbatim
+                                ? "Evidence from Requirement:"
+                                : "Evidence Reference:"}
+                            </span>
+                            {evaluated.isOmission ? (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-400 border border-amber-500/20 font-medium">
+                                Unstated in requirement
+                              </span>
+                            ) : evaluated.isVerbatim ? (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 font-medium">
+                                Verified Quote
+                              </span>
+                            ) : (
+                              <span className="text-[10px] px-1.5 py-0.5 rounded bg-zinc-500/10 text-zinc-400 border border-zinc-500/20 font-medium">
+                                Unverified Reference
+                              </span>
+                            )}
+                          </div>
+                          {evaluated.isOmission ? (
+                            <span className="not-italic text-zinc-300">{evaluated.cleanText}</span>
+                          ) : evaluated.isVerbatim ? (
+                            <span>&ldquo;{evaluated.cleanText}&rdquo;</span>
+                          ) : (
+                            <span className="not-italic text-zinc-300">
+                              {evaluated.cleanText}{" "}
+                              <span className="text-zinc-500 text-xs">
+                                (not found verbatim in requirement)
+                              </span>
+                            </span>
+                          )}
+                        </div>
+                      );
+                    })()}
 
                     {/* Grid: What's Missing & Why It Matters */}
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-1">
