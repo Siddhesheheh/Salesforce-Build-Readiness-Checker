@@ -31,6 +31,11 @@ export interface HttpAttemptTiming {
   retry_skipped_insufficient_time?: boolean;
   finish_reason?: string;
   usage?: GeminiUsageMetadata;
+  resolved_thinking_level?: string;
+  thinking_config_present?: boolean;
+  max_output_tokens?: number | "unset";
+  system_prompt_length?: number;
+  user_prompt_length?: number;
 }
 
 /**

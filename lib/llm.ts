@@ -3,7 +3,12 @@
  * Never call this from client/browser code.
  */
 
-import { reviewAbortContext, reviewDiagnosticsContext } from "./request-context";
+import {
+  reviewAbortContext,
+  reviewDiagnosticsContext,
+  ReviewDiagnosticsCollector,
+  HttpAttemptTiming,
+} from "./request-context";
 
 export class UpstreamApiError extends Error {
   statusCode?: number;
@@ -314,6 +319,44 @@ export async function callModel(
   const defaultTimeoutMs = isInteractive ? MAX_INTERACTIVE_ATTEMPT_MS : 30000;
   const configuredTimeoutMs = optionsTimeout !== undefined ? optionsTimeout : defaultTimeoutMs;
 
+  // Prompt T: Safe diagnostic logging helper for interactive reviews
+  const recordAndLogAttempt = (
+    timing: Omit<
+      HttpAttemptTiming,
+      | "resolved_thinking_level"
+      | "thinking_config_present"
+      | "max_output_tokens"
+      | "system_prompt_length"
+      | "user_prompt_length"
+    >
+  ) => {
+    const fullTiming: HttpAttemptTiming = {
+      ...timing,
+      resolved_thinking_level: resolvedThinking ?? "unset",
+      thinking_config_present: Boolean(generationConfig.thinkingConfig),
+      max_output_tokens: generationConfig.maxOutputTokens ?? "unset",
+      system_prompt_length: system.length,
+      user_prompt_length: user.length,
+    };
+    diagCollector?.recordAttempt(fullTiming);
+    if (diagCollector) {
+      console.log(
+        JSON.stringify({
+          event: "gemini_attempt_diagnostics",
+          model: fullTiming.model,
+          resolved_thinking_level: fullTiming.resolved_thinking_level,
+          thinking_config_present: fullTiming.thinking_config_present,
+          max_output_tokens: fullTiming.max_output_tokens,
+          system_prompt_length: fullTiming.system_prompt_length,
+          user_prompt_length: fullTiming.user_prompt_length,
+          attempt: fullTiming.attempt,
+          status: fullTiming.status ?? null,
+          duration_ms: fullTiming.duration_ms,
+        })
+      );
+    }
+  };
+
   for (let attempt = 0; attempt <= maxTransientRetries; attempt++) {
     if (effectiveSignal?.aborted) {
       throw new UpstreamApiError("Gemini API request aborted: overall deadline exceeded.", 504);
@@ -328,7 +371,7 @@ export async function callModel(
         const safeRemaining = Math.max(0, diagCollector.remainingMs - 2000);
         if (safeRemaining < MIN_REASONABLE_ATTEMPT_TIME_MS) {
           diagCollector.retrySkippedDueToInsufficientTime = true;
-          diagCollector.recordAttempt({
+          recordAndLogAttempt({
             attempt: attempt + 1,
             model,
             phase: diagCollector.activePhase,
@@ -438,7 +481,7 @@ export async function callModel(
 
       // Check if overall review deadline or external signal aborted this request
       if (effectiveSignal?.aborted) {
-        diagCollector?.recordAttempt({
+        recordAndLogAttempt({
           attempt: attempt + 1,
           model,
           phase: currentPhase,
@@ -456,7 +499,7 @@ export async function callModel(
       // Check if transient network retry is feasible
       if (attempt < maxTransientRetries) {
         if (budget && budget.isExhausted) {
-          diagCollector?.recordAttempt({
+          recordAndLogAttempt({
             attempt: attempt + 1,
             model,
             phase: currentPhase,
@@ -479,7 +522,7 @@ export async function callModel(
           const safeRemainingForRetry = remainingAfterBackoff - 2000;
           if (safeRemainingForRetry < MIN_REASONABLE_ATTEMPT_TIME_MS) {
             diagCollector.retrySkippedDueToInsufficientTime = true;
-            diagCollector.recordAttempt({
+            recordAndLogAttempt({
               attempt: attempt + 1,
               model,
               phase: currentPhase,
@@ -496,7 +539,7 @@ export async function callModel(
           }
         }
 
-        diagCollector?.recordAttempt({
+        recordAndLogAttempt({
           attempt: attempt + 1,
           model,
           phase: currentPhase,
@@ -514,7 +557,7 @@ export async function callModel(
         continue;
       }
 
-      diagCollector?.recordAttempt({
+      recordAndLogAttempt({
         attempt: attempt + 1,
         model,
         phase: currentPhase,
@@ -556,7 +599,7 @@ export async function callModel(
       // Check if 429 rate limit / quota
       if (response.status === 429) {
         const details = parse429Details(sanitizedError, response.headers);
-        diagCollector?.recordAttempt({
+        recordAndLogAttempt({
           attempt: attempt + 1,
           model,
           phase: currentPhase,
@@ -577,7 +620,7 @@ export async function callModel(
       const isTransient = [502, 503, 504].includes(response.status);
       if (isTransient && attempt < maxTransientRetries) {
         if (effectiveSignal?.aborted) {
-          diagCollector?.recordAttempt({
+          recordAndLogAttempt({
             attempt: attempt + 1,
             model,
             phase: currentPhase,
@@ -595,7 +638,7 @@ export async function callModel(
 
         // Can we make another attempt within budget?
         if (budget && budget.isExhausted) {
-          diagCollector?.recordAttempt({
+          recordAndLogAttempt({
             attempt: attempt + 1,
             model,
             phase: currentPhase,
@@ -624,7 +667,7 @@ export async function callModel(
           const safeRemainingForRetry = remainingAfterBackoff - 2000;
           if (safeRemainingForRetry < MIN_REASONABLE_ATTEMPT_TIME_MS) {
             diagCollector.retrySkippedDueToInsufficientTime = true;
-            diagCollector.recordAttempt({
+            recordAndLogAttempt({
               attempt: attempt + 1,
               model,
               phase: currentPhase,
@@ -642,7 +685,7 @@ export async function callModel(
           }
         }
 
-        diagCollector?.recordAttempt({
+        recordAndLogAttempt({
           attempt: attempt + 1,
           model,
           phase: currentPhase,
@@ -661,7 +704,7 @@ export async function callModel(
         continue;
       }
 
-      diagCollector?.recordAttempt({
+      recordAndLogAttempt({
         attempt: attempt + 1,
         model,
         phase: currentPhase,
@@ -699,7 +742,7 @@ export async function callModel(
       : undefined;
 
     if (!candidate || !candidate.content?.parts?.[0]?.text) {
-      diagCollector?.recordAttempt({
+      recordAndLogAttempt({
         attempt: attempt + 1,
         model,
         phase: currentPhase,
@@ -714,7 +757,7 @@ export async function callModel(
       throw new UpstreamApiError(`Gemini returned empty response (finishReason: ${finishReason})`);
     }
 
-    diagCollector?.recordAttempt({
+    recordAndLogAttempt({
       attempt: attempt + 1,
       model,
       phase: currentPhase,
