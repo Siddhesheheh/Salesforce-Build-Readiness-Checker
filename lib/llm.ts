@@ -191,6 +191,7 @@ export function parse429Details(
 
 export interface CallModelOptions {
   model?: string;
+  fallbackModel?: string | null;
   budget?: RequestBudget;
   pacer?: RequestPacer;
   maxTransientRetries?: number; // default: 2 (meaning up to 3 total attempts)
@@ -241,6 +242,18 @@ export function resolveModelName(configuredModel?: string | null): string {
   return stripped || "gemini-3.8-flash";
 }
 
+/**
+ * Resolves the configured fallback Gemini model identifier.
+ * Returns null if fallback model is not set.
+ */
+export function resolveFallbackModelName(configuredFallback?: string | null): string | null {
+  const raw = configuredFallback !== undefined ? configuredFallback : process.env.LLM_FALLBACK_MODEL;
+  if (!raw) return null;
+  const trimmed = typeof raw === "string" ? raw.trim() : "";
+  const stripped = trimmed.replace(/^models\//i, "");
+  return stripped || null;
+}
+
 /** Minimum viable duration (ms) for Gemini Flash to generate a complete 10-category rubric JSON report */
 export const MIN_REASONABLE_ATTEMPT_TIME_MS = 14000;
 
@@ -253,7 +266,8 @@ export async function callModel(
   options: CallModelOptions = {}
 ): Promise<string> {
   const apiKey = process.env.GEMINI_API_KEY || process.env.LLM_API_KEY;
-  const model = resolveModelName(options.model);
+  const primaryModel = resolveModelName(options.model);
+  const fallbackModel = resolveFallbackModelName(options.fallbackModel);
 
   if (!apiKey) {
     throw new UpstreamApiError("GEMINI_API_KEY or LLM_API_KEY is not set in environment.");
@@ -272,42 +286,13 @@ export async function callModel(
     thinkingLevel: optionsThinkingLevel,
   } = options;
 
-  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
-
-  const resolvedThinking = resolveThinkingLevel(model, optionsThinkingLevel);
-
-  const generationConfig: any = {
-    temperature: 0.2,
-    responseMimeType: "application/json",
-  };
-
-  if (resolvedThinking) {
-    generationConfig.thinkingConfig = {
-      thinkingLevel: resolvedThinking,
-    };
-  }
-
-  const payload = {
-    systemInstruction: {
-      parts: [{ text: system }],
-    },
-    contents: [
-      {
-        role: "user",
-        parts: [{ text: user }],
-      },
-    ],
-    generationConfig,
-  };
-
-  const bodyStr = JSON.stringify(payload);
   const ambientController = reviewAbortContext.getStore();
   const diagCollector = reviewDiagnosticsContext.getStore();
   const isInteractive = Boolean(ambientController || diagCollector);
   const effectiveSignal = externalSignal || ambientController?.signal;
 
   if (diagCollector && (!diagCollector.model || diagCollector.model === "unknown")) {
-    diagCollector.model = model;
+    diagCollector.model = primaryModel;
   }
 
   // In interactive reviews, default to 1 transient retry (up to 2 attempts max) to fit within deadline.
@@ -319,48 +304,84 @@ export async function callModel(
   const defaultTimeoutMs = isInteractive ? MAX_INTERACTIVE_ATTEMPT_MS : 30000;
   const configuredTimeoutMs = optionsTimeout !== undefined ? optionsTimeout : defaultTimeoutMs;
 
-  // Prompt T: Safe diagnostic logging helper for interactive reviews
-  const recordAndLogAttempt = (
-    timing: Omit<
-      HttpAttemptTiming,
-      | "resolved_thinking_level"
-      | "thinking_config_present"
-      | "max_output_tokens"
-      | "system_prompt_length"
-      | "user_prompt_length"
-    >
-  ) => {
-    const fullTiming: HttpAttemptTiming = {
-      ...timing,
-      resolved_thinking_level: resolvedThinking ?? "unset",
-      thinking_config_present: Boolean(generationConfig.thinkingConfig),
-      max_output_tokens: generationConfig.maxOutputTokens ?? "unset",
-      system_prompt_length: system.length,
-      user_prompt_length: user.length,
-    };
-    diagCollector?.recordAttempt(fullTiming);
-    if (diagCollector) {
-      console.log(
-        JSON.stringify({
-          event: "gemini_attempt_diagnostics",
-          model: fullTiming.model,
-          resolved_thinking_level: fullTiming.resolved_thinking_level,
-          thinking_config_present: fullTiming.thinking_config_present,
-          max_output_tokens: fullTiming.max_output_tokens,
-          system_prompt_length: fullTiming.system_prompt_length,
-          user_prompt_length: fullTiming.user_prompt_length,
-          attempt: fullTiming.attempt,
-          status: fullTiming.status ?? null,
-          duration_ms: fullTiming.duration_ms,
-        })
-      );
-    }
-  };
-
   for (let attempt = 0; attempt <= maxTransientRetries; attempt++) {
     if (effectiveSignal?.aborted) {
       throw new UpstreamApiError("Gemini API request aborted: overall deadline exceeded.", 504);
     }
+
+    // Prompt Y: Determine active model for this attempt (switch to fallback on retries if configured)
+    const currentModel = attempt > 0 && fallbackModel ? fallbackModel : primaryModel;
+    const currentResolvedThinking = resolveThinkingLevel(currentModel, optionsThinkingLevel);
+
+    const currentGenerationConfig: any = {
+      temperature: 0.2,
+      responseMimeType: "application/json",
+    };
+
+    if (currentResolvedThinking) {
+      currentGenerationConfig.thinkingConfig = {
+        thinkingLevel: currentResolvedThinking,
+      };
+    }
+
+    const currentPayload = {
+      systemInstruction: {
+        parts: [{ text: system }],
+      },
+      contents: [
+        {
+          role: "user",
+          parts: [{ text: user }],
+        },
+      ],
+      generationConfig: currentGenerationConfig,
+    };
+
+    const bodyStr = JSON.stringify(currentPayload);
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(currentModel)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+
+    if (diagCollector) {
+      diagCollector.model = currentModel;
+    }
+
+    // Prompt T & Y: Safe diagnostic logging helper recording actual model used
+    const recordAndLogAttempt = (
+      timing: Omit<
+        HttpAttemptTiming,
+        | "resolved_thinking_level"
+        | "thinking_config_present"
+        | "max_output_tokens"
+        | "system_prompt_length"
+        | "user_prompt_length"
+      >
+    ) => {
+      const fullTiming: HttpAttemptTiming = {
+        ...timing,
+        model: currentModel,
+        resolved_thinking_level: currentResolvedThinking ?? "unset",
+        thinking_config_present: Boolean(currentGenerationConfig.thinkingConfig),
+        max_output_tokens: currentGenerationConfig.maxOutputTokens ?? "unset",
+        system_prompt_length: system.length,
+        user_prompt_length: user.length,
+      };
+      diagCollector?.recordAttempt(fullTiming);
+      if (diagCollector) {
+        console.log(
+          JSON.stringify({
+            event: "gemini_attempt_diagnostics",
+            model: fullTiming.model,
+            resolved_thinking_level: fullTiming.resolved_thinking_level,
+            thinking_config_present: fullTiming.thinking_config_present,
+            max_output_tokens: fullTiming.max_output_tokens,
+            system_prompt_length: fullTiming.system_prompt_length,
+            user_prompt_length: fullTiming.user_prompt_length,
+            attempt: fullTiming.attempt,
+            status: fullTiming.status ?? null,
+            duration_ms: fullTiming.duration_ms,
+          })
+        );
+      }
+    };
 
     const remainingBudgetAtStart = diagCollector ? diagCollector.remainingMs : undefined;
 
@@ -373,7 +394,7 @@ export async function callModel(
           diagCollector.retrySkippedDueToInsufficientTime = true;
           recordAndLogAttempt({
             attempt: attempt + 1,
-            model,
+            model: currentModel,
             phase: diagCollector.activePhase,
             duration_ms: 0,
             remaining_budget_ms: remainingBudgetAtStart,
@@ -483,7 +504,7 @@ export async function callModel(
       if (effectiveSignal?.aborted) {
         recordAndLogAttempt({
           attempt: attempt + 1,
-          model,
+          model: currentModel,
           phase: currentPhase,
           duration_ms: attemptDuration,
           remaining_budget_ms: remainingBudgetAtStart,
@@ -501,7 +522,7 @@ export async function callModel(
         if (budget && budget.isExhausted) {
           recordAndLogAttempt({
             attempt: attempt + 1,
-            model,
+            model: currentModel,
             phase: currentPhase,
             duration_ms: attemptDuration,
             remaining_budget_ms: remainingBudgetAtStart,
@@ -513,8 +534,10 @@ export async function callModel(
             504
           );
         }
-        const backoff =
-          Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
+        const isSwitchingToFallback = Boolean(fallbackModel && currentModel !== fallbackModel);
+        const backoff = isSwitchingToFallback
+          ? 0
+          : Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
 
         // In interactive mode, check if there is enough time left to sleep and make another attempt
         if (diagCollector && diagCollector.overallDeadlineMs > 5000) {
@@ -524,7 +547,7 @@ export async function callModel(
             diagCollector.retrySkippedDueToInsufficientTime = true;
             recordAndLogAttempt({
               attempt: attempt + 1,
-              model,
+              model: currentModel,
               phase: currentPhase,
               duration_ms: attemptDuration,
               remaining_budget_ms: remainingBudgetAtStart,
@@ -541,7 +564,7 @@ export async function callModel(
 
         recordAndLogAttempt({
           attempt: attempt + 1,
-          model,
+          model: currentModel,
           phase: currentPhase,
           duration_ms: attemptDuration,
           remaining_budget_ms: remainingBudgetAtStart,
@@ -559,7 +582,7 @@ export async function callModel(
 
       recordAndLogAttempt({
         attempt: attempt + 1,
-        model,
+        model: currentModel,
         phase: currentPhase,
         duration_ms: attemptDuration,
         remaining_budget_ms: remainingBudgetAtStart,
@@ -601,7 +624,7 @@ export async function callModel(
         const details = parse429Details(sanitizedError, response.headers);
         recordAndLogAttempt({
           attempt: attempt + 1,
-          model,
+          model: currentModel,
           phase: currentPhase,
           duration_ms: attemptDuration,
           remaining_budget_ms: remainingBudgetAtStart,
@@ -622,7 +645,7 @@ export async function callModel(
         if (effectiveSignal?.aborted) {
           recordAndLogAttempt({
             attempt: attempt + 1,
-            model,
+            model: currentModel,
             phase: currentPhase,
             duration_ms: attemptDuration,
             remaining_budget_ms: remainingBudgetAtStart,
@@ -640,7 +663,7 @@ export async function callModel(
         if (budget && budget.isExhausted) {
           recordAndLogAttempt({
             attempt: attempt + 1,
-            model,
+            model: currentModel,
             phase: currentPhase,
             duration_ms: attemptDuration,
             remaining_budget_ms: remainingBudgetAtStart,
@@ -654,9 +677,12 @@ export async function callModel(
           );
         }
 
+        const isSwitchingToFallback = Boolean(fallbackModel && currentModel !== fallbackModel);
         const retryAfterMs = parseRetryAfter(response.headers?.get?.("retry-after"));
         const rawBackoff =
-          retryAfterMs !== null
+          (isSwitchingToFallback && response.status === 503)
+            ? 0
+            : retryAfterMs !== null
             ? retryAfterMs
             : Math.min(maxBackoffMs, baseBackoffMs * Math.pow(2, attempt)) + Math.random() * jitterMs;
         const backoff = Math.min(rawBackoff, maxBackoffMs);
@@ -669,7 +695,7 @@ export async function callModel(
             diagCollector.retrySkippedDueToInsufficientTime = true;
             recordAndLogAttempt({
               attempt: attempt + 1,
-              model,
+              model: currentModel,
               phase: currentPhase,
               duration_ms: attemptDuration,
               remaining_budget_ms: remainingBudgetAtStart,
@@ -687,7 +713,7 @@ export async function callModel(
 
         recordAndLogAttempt({
           attempt: attempt + 1,
-          model,
+          model: currentModel,
           phase: currentPhase,
           duration_ms: attemptDuration,
           remaining_budget_ms: remainingBudgetAtStart,
@@ -706,7 +732,7 @@ export async function callModel(
 
       recordAndLogAttempt({
         attempt: attempt + 1,
-        model,
+        model: currentModel,
         phase: currentPhase,
         duration_ms: attemptDuration,
         remaining_budget_ms: remainingBudgetAtStart,
@@ -744,7 +770,7 @@ export async function callModel(
     if (!candidate || !candidate.content?.parts?.[0]?.text) {
       recordAndLogAttempt({
         attempt: attempt + 1,
-        model,
+        model: currentModel,
         phase: currentPhase,
         duration_ms: attemptDuration,
         remaining_budget_ms: remainingBudgetAtStart,
@@ -759,7 +785,7 @@ export async function callModel(
 
     recordAndLogAttempt({
       attempt: attempt + 1,
-      model,
+      model: currentModel,
       phase: currentPhase,
       duration_ms: attemptDuration,
       remaining_budget_ms: remainingBudgetAtStart,
